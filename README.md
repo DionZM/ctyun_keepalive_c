@@ -4,7 +4,7 @@
 
 ## 致谢
 
-本项目根据 [Amamiyashi0n/ctyun_keepalive](https://github.com/Amamiyashi0n/ctyun_keepalive) 中的 Python 脚本重构为 C 语言脚本，目的是自运行和极限低系统资源占用，同时对他表示感谢。
+感谢 [Amamiyashi0n/ctyun_keepalive](https://github.com/Amamiyashi0n/ctyun_keepalive) 提供的 Python 版本实现，本项目在此基础上用 C 语言进行了重构，以获得更低的系统资源占用和更好的自运行能力。
 
 ## 平台支持
 
