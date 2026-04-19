@@ -1,0 +1,19 @@
+# Build artifacts
+*.exe
+*.obj
+*.o
+*.lib
+*.pdb
+*.ilk
+*.exp
+
+# Runtime files
+run.log
+config.json
+
+# IDE files
+.vs/
+*.user
+*.suo
+*.sln
+*.vcxproj*
