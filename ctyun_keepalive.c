@@ -111,6 +111,7 @@ static void refresh_banner(void) {
 }
 
 static DWORD WINAPI console_input_thread(LPVOID param) {
+    (void)param;
     HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
     INPUT_RECORD ir;
     DWORD count;
@@ -531,8 +532,6 @@ static void desktop_free_certs(Desktop *d) {
     /* 第二步: 预构建WebSocket URI(仅在首次调用时) */
     if (!d->ws_uri && d->host) {
         d->ws_uri = (char *)malloc(512);
-        /* 优先使用clink_host(CLink代理地址)，否则直连host */
-        const char *h = (d->clink_host && d->clink_host[0]) ? d->clink_host : d->host;
         const char *p_str = (d->port && d->port[0]) ? d->port : "443";
         if (d->clink_host && d->clink_host[0] && strchr(d->clink_host, ':') == NULL)
             /* CLink代理地址不含端口，需显式添加 */
@@ -1422,11 +1421,11 @@ static void chacha20_xor(const uint8_t *src, size_t n, const uint8_t key[32],
  */
 static void poly1305(const uint8_t *msg, size_t mlen, const uint8_t key[32], uint8_t tag[16]) {
     /* 从密钥中提取r值(前16字节)，进行clamping(固定位清零) */
-    uint32_t r0 = key[0]|(key[1]<<8)|(key[2]<<16)|(key[3]<<24);
-    uint32_t r1 = (key[3]>>2)|(key[4]<<6)|(key[5]<<14)|(key[6]<<22);
-    uint32_t r2 = (key[6]>>4)|(key[7]<<4)|(key[8]<<12)|(key[9]<<20);
-    uint32_t r3 = (key[9]>>6)|(key[10]<<2)|(key[11]<<10)|(key[12]<<18);
-    uint32_t r4 = (key[12]>>8)|(key[13]<<0)|(key[14]<<8)|(key[15]<<16);
+    uint32_t r0 = key[0]|((uint32_t)key[1]<<8)|((uint32_t)key[2]<<16)|((uint32_t)key[3]<<24);
+    uint32_t r1 = ((uint32_t)key[3]>>2)|((uint32_t)key[4]<<6)|((uint32_t)key[5]<<14)|((uint32_t)key[6]<<22);
+    uint32_t r2 = ((uint32_t)key[6]>>4)|((uint32_t)key[7]<<4)|((uint32_t)key[8]<<12)|((uint32_t)key[9]<<20);
+    uint32_t r3 = ((uint32_t)key[9]>>6)|((uint32_t)key[10]<<2)|((uint32_t)key[11]<<10)|((uint32_t)key[12]<<18);
+    uint32_t r4 = ((uint32_t)key[12]>>8)|((uint32_t)key[13]<<0)|((uint32_t)key[14]<<8)|((uint32_t)key[15]<<16);
     /* Clamping: 固定位清零，确保r在特定范围内 */
     r0 &= 0x3ffffff; r1 &= 0x3ffff03; r2 &= 0x3ffc0ff; r3 &= 0x3f03fff; r4 &= 0x00fffff;
     /* 预计算 r*5 (用于约化) */
@@ -1444,11 +1443,11 @@ static void poly1305(const uint8_t *msg, size_t mlen, const uint8_t key[32], uin
         uint32_t hibit = r == 16 ? (1u << 24) : 0;
         if (r < 16) blk[r] = 1;
         /* 将块解码为5个26位limb */
-        uint32_t t0=blk[0]|(blk[1]<<8)|(blk[2]<<16)|(blk[3]<<24);
-        uint32_t t1=(blk[3]>>2)|(blk[4]<<6)|(blk[5]<<14)|(blk[6]<<22);
-        uint32_t t2=(blk[6]>>4)|(blk[7]<<4)|(blk[8]<<12)|(blk[9]<<20);
-        uint32_t t3=(blk[9]>>6)|(blk[10]<<2)|(blk[11]<<10)|(blk[12]<<18);
-        uint32_t t4=(blk[12]>>8)|(blk[13]<<0)|(blk[14]<<8)|(blk[15]<<16);
+        uint32_t t0=blk[0]|((uint32_t)blk[1]<<8)|((uint32_t)blk[2]<<16)|((uint32_t)blk[3]<<24);
+        uint32_t t1=((uint32_t)blk[3]>>2)|((uint32_t)blk[4]<<6)|((uint32_t)blk[5]<<14)|((uint32_t)blk[6]<<22);
+        uint32_t t2=((uint32_t)blk[6]>>4)|((uint32_t)blk[7]<<4)|((uint32_t)blk[8]<<12)|((uint32_t)blk[9]<<20);
+        uint32_t t3=((uint32_t)blk[9]>>6)|((uint32_t)blk[10]<<2)|((uint32_t)blk[11]<<10)|((uint32_t)blk[12]<<18);
+        uint32_t t4=((uint32_t)blk[12]>>8)|((uint32_t)blk[13]<<0)|((uint32_t)blk[14]<<8)|((uint32_t)blk[15]<<16);
         /* 累加到h */
         h0+=t0&0x3ffffff; h1+=t1&0x3ffffff; h2+=t2&0x3ffffff;
         h3+=t3&0x3ffffff; h4+=(t4&0x3ffffff)+hibit;
@@ -1498,10 +1497,10 @@ static void poly1305(const uint8_t *msg, size_t mlen, const uint8_t key[32], uin
     ff2+=k2+(ff1>>32); ff1&=0xffffffff;
     ff3+=k3+(ff2>>32); ff2&=0xffffffff; ff3&=0xffffffff;
     f0=(uint32_t)ff0; f1=(uint32_t)ff1; f2=(uint32_t)ff2; f3=(uint32_t)ff3;
-    tag[0]=f0;tag[1]=f0>>8;tag[2]=f0>>16;tag[3]=f0>>24;
-    tag[4]=f1;tag[5]=f1>>8;tag[6]=f1>>16;tag[7]=f1>>24;
-    tag[8]=f2;tag[9]=f2>>8;tag[10]=f2>>16;tag[11]=f2>>24;
-    tag[12]=f3;tag[13]=f3>>8;tag[14]=f3>>16;tag[15]=f3>>24;
+    tag[0]=(uint8_t)f0;tag[1]=(uint8_t)(f0>>8);tag[2]=(uint8_t)(f0>>16);tag[3]=(uint8_t)(f0>>24);
+    tag[4]=(uint8_t)f1;tag[5]=(uint8_t)(f1>>8);tag[6]=(uint8_t)(f1>>16);tag[7]=(uint8_t)(f1>>24);
+    tag[8]=(uint8_t)f2;tag[9]=(uint8_t)(f2>>8);tag[10]=(uint8_t)(f2>>16);tag[11]=(uint8_t)(f2>>24);
+    tag[12]=(uint8_t)f3;tag[13]=(uint8_t)(f3>>8);tag[14]=(uint8_t)(f3>>16);tag[15]=(uint8_t)(f3>>24);
 }
 
 /**
@@ -2296,7 +2295,7 @@ static int ws_connect(const char *uri, WSConn *wsc) {
     }
 
     /* 完成WebSocket升级 */
-    wsc->hWebSocket = WinHttpWebSocketCompleteUpgrade(wsc->hRequest, NULL);
+    wsc->hWebSocket = WinHttpWebSocketCompleteUpgrade(wsc->hRequest, (DWORD_PTR)NULL);
     if (!wsc->hWebSocket) {
         log_line("WinHttpWebSocketCompleteUpgrade failed: %lu", GetLastError());
         WinHttpCloseHandle(wsc->hRequest);
@@ -2529,7 +2528,7 @@ static BOOL WINAPI ctrl_handler(DWORD type) {
  * usage - 显示用法帮助
  */
 static void usage(const char *exe) {
-    printf("\xe6\x9f\x90\xe4\xba\x91\xe7\x94\xb5\xe8\x84\x91\xe4\xbf\x9d\xe6\xb4\xbb\xe5\xae\xa2\xe6\x88\xb7\xe7\xab\xaf v1.0.0\n");
+    printf("\xe5\xa4\xa9\xe7\xbf\xbc\xe4\xba\x91\xe7\x94\xb5\xe8\x84\x91\xe4\xbf\x9d\xe6\xb4\xbb\xe5\xae\xa2\xe6\x88\xb7\xe7\xab\xaf v1.0.0\n");
     printf("\xe7\x94\xa8\xe6\xb3\x95: %s [--background|-b]\n", exe);
     printf("  --background, -b  \xe5\x90\x8e\xe5\x8f\xb0\xe8\xbf\x90\xe8\xa1\x8c\xef\xbc\x8c\xe6\x97\xa5\xe5\xbf\x97\xe5\x86\x99\xe5\x85\xa5run.log\n");
 }
@@ -2582,7 +2581,7 @@ int main(int argc, char *argv[]) {
     crypto_init();
     http_init();
 
-    log_line("\xe6\x9f\x90\xe4\xba\x91\xe7\x94\xb5\xe8\x84\x91\xe4\xbf\x9d\xe6\xb4\xbb C 1.0.0");
+    log_line("\xe5\xa4\xa9\xe7\xbf\xbc\xe4\xba\x91\xe7\x94\xb5\xe8\x84\x91\xe4\xbf\x9d\xe6\xb4\xbb C 1.0.0");
 
     /* 解析用户凭据(尝试自动解密config.json，失败则手动输入) */
     Session session = {0};
