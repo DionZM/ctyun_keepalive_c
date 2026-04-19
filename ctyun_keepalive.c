@@ -17,7 +17,7 @@
  *      /link /SUBSYSTEM:CONSOLE /STACK:131072,131072 /OPT:REF /OPT:ICF ^
  *      winhttp.lib ws2_32.lib crypt32.lib advapi32.lib iphlpapi.lib bcrypt.lib
  *
- * 版本: 1.0.0
+ * 版本: 1.1.0
  */
 
 /* ======================== 标准库与系统头文件 ======================== */
@@ -79,6 +79,8 @@ static FILE *g_log_file = NULL;
 static char g_log_path[MAX_PATH] = "";
 
 static volatile LONG g_bg_switch = 0;
+
+static int g_privacy = 0;
 
 /* ======================== 工具函数 ======================== */
 
@@ -1996,27 +1998,31 @@ static int resolve_credentials(Session *s) {
     /* 执行登录 */
     if (!do_login(s, user, pass)) return 0;
 
-    /* 登录成功，加密保存凭据到config.json */
-    char salt[33];
-    BYTE salt_bytes[16];
-    CryptGenRandom(g_crypt, 16, salt_bytes);
-    for (int i = 0; i < 16; i++) sprintf(salt + i * 2, "%02x", salt_bytes[i]);
-    salt[32] = 0;
+    /* 登录成功，加密保存凭据到config.json(隐私模式下跳过) */
+    if (!g_privacy) {
+        char salt[33];
+        BYTE salt_bytes[16];
+        CryptGenRandom(g_crypt, 16, salt_bytes);
+        for (int i = 0; i < 16; i++) sprintf(salt + i * 2, "%02x", salt_bytes[i]);
+        salt[32] = 0;
 
-    uint8_t key[32];
-    derive_key(fp, salt, key);
+        uint8_t key[32];
+        derive_key(fp, salt, key);
 
-    char enc_user[2048], enc_pass[2048], enc_dc[2048];
-    encrypt_data(user, key, enc_user);
-    encrypt_data(pass, key, enc_pass);
-    encrypt_data(s->device_code, key, enc_dc);
+        char enc_user[2048], enc_pass[2048], enc_dc[2048];
+        encrypt_data(user, key, enc_user);
+        encrypt_data(pass, key, enc_pass);
+        encrypt_data(s->device_code, key, enc_dc);
 
-    f = fopen(config_path, "w");
-    if (f) {
-        fprintf(f, "{\"salt\":\"%s\",\"accounts\":[{\"user_account\":\"%s\",\"password\":\"%s\",\"device_code\":\"%s\"}]}",
-                salt, enc_user, enc_pass, enc_dc);
-        fclose(f);
-        log_line("config saved to %s", config_path);
+        f = fopen(config_path, "w");
+        if (f) {
+            fprintf(f, "{\"salt\":\"%s\",\"accounts\":[{\"user_account\":\"%s\",\"password\":\"%s\",\"device_code\":\"%s\"}]}",
+                    salt, enc_user, enc_pass, enc_dc);
+            fclose(f);
+            log_line("config saved to %s", config_path);
+        }
+    } else {
+        log_line("\xe9\x9a\x90\xe7\xa7\x81\xe6\xa8\xa1\xe5\xbc\x8f\xe5\xb7\xb2\xe5\x90\xaf\xe7\x94\xa8\xef\xbc\x8c\xe4\xb8\x8d\xe4\xbf\x9d\xe5\xad\x98\xe5\x87\xad\xe6\x8d\xae");
     }
 
     return 1;
@@ -2528,9 +2534,14 @@ static BOOL WINAPI ctrl_handler(DWORD type) {
  * usage - 显示用法帮助
  */
 static void usage(const char *exe) {
-    printf("\xe5\xa4\xa9\xe7\xbf\xbc\xe4\xba\x91\xe7\x94\xb5\xe8\x84\x91\xe4\xbf\x9d\xe6\xb4\xbb\xe5\xae\xa2\xe6\x88\xb7\xe7\xab\xaf v1.0.0\n");
-    printf("\xe7\x94\xa8\xe6\xb3\x95: %s [--background|-b]\n", exe);
-    printf("  --background, -b  \xe5\x90\x8e\xe5\x8f\xb0\xe8\xbf\x90\xe8\xa1\x8c\xef\xbc\x8c\xe6\x97\xa5\xe5\xbf\x97\xe5\x86\x99\xe5\x85\xa5run.log\n");
+    printf("天翼云电脑保活客户端 v1.1.0\n");
+    printf("项目地址: https://github.com/DionZM/ctyun_keepalive_c\n\n");
+    printf("用法: %s [OPTIONS]\n\n", exe);
+    printf("OPTIONS:\n");
+    printf("  --background, -b  后台运行，日志写入run.log\n");
+    printf("  --privacy,    -p  隐私模式，不保存用户名/密码到config.json\n");
+    printf("  --version,    -v  显示版本号\n");
+    printf("  --help,       -h  显示此帮助信息\n");
 }
 
 /**
@@ -2549,10 +2560,14 @@ static void usage(const char *exe) {
  * 10. 清理资源并退出
  */
 int main(int argc, char *argv[]) {
-    /* 解析命令行参数 */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--background") == 0 || strcmp(argv[i], "-b") == 0) {
             g_background = 1;
+        } else if (strcmp(argv[i], "--privacy") == 0 || strcmp(argv[i], "-p") == 0) {
+            g_privacy = 1;
+        } else if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
+            printf("v1.1.0\n");
+            return 0;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
             return 0;
@@ -2581,7 +2596,7 @@ int main(int argc, char *argv[]) {
     crypto_init();
     http_init();
 
-    log_line("\xe5\xa4\xa9\xe7\xbf\xbc\xe4\xba\x91\xe7\x94\xb5\xe8\x84\x91\xe4\xbf\x9d\xe6\xb4\xbb C 1.0.0");
+    log_line("\xe5\xa4\xa9\xe7\xbf\xbc\xe4\xba\x91\xe7\x94\xb5\xe8\x84\x91\xe4\xbf\x9d\xe6\xb4\xbb C 1.1.0");
 
     /* 解析用户凭据(尝试自动解密config.json，失败则手动输入) */
     Session session = {0};
