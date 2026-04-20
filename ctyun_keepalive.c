@@ -5,19 +5,26 @@
  *   自动登录天翼云电脑平台，获取桌面列表，对运行中的桌面建立WebSocket保活连接，
  *   对未运行的桌面定时检测状态，开机后自动切换为保活模式。
  *
+ * 验证码处理:
+ *   - OCR优先自动识别，失败后弹出独立Win32窗口全分辨率显示验证码图片
+ *   - 窗口运行在独立线程，持久化不自动关闭，支持手工输入
+ *   - OCR连接失败/返回错误/连续3次验证失败时触发手工输入模式
+ *   - 手工输入连续3次失败输出"验证码识别错误"并退出程序
+ *
  * 内存优化:
  *   - Desktop结构体使用动态指针代替固定数组，保活阶段释放证书等大块内存
  *   - 使用DesktopLight轻量结构体进行状态轮询，减少栈/堆占用
  *   - 定期调用trim_working_set()将物理内存页归还操作系统
  *   - connect_msg按需精确分配，替代固定12KB缓冲区
  *   - 预构建ws_uri，保活阶段释放host/port/clink_host等连接参数
+ *   - WebSocket保活循环使用堆分配缓冲区，避免每次循环栈分配
  *
  * 编译 (MSVC x64):
  *   cl /O2 /MD /GS- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8 ctyun_keepalive.c ^
  *      /link /SUBSYSTEM:CONSOLE /STACK:131072,131072 /OPT:REF /OPT:ICF ^
  *      winhttp.lib ws2_32.lib crypt32.lib advapi32.lib iphlpapi.lib bcrypt.lib ole32.lib windowscodecs.lib user32.lib gdi32.lib
  *
- * 版本: 1.1.0
+ * 版本: 1.2.0
  */
 
 /* ======================== 标准库与系统头文件 ======================== */
@@ -56,6 +63,7 @@
 #pragma comment(lib, "gdi32.lib")       /* GDI: CreateDIBSection, StretchBlt */
 
 /* ======================== 常量定义 ======================== */
+#define APP_VERSION   "1.2.0"
 #define MAX_DESKTOPS  10       /* 最大桌面数量 */
 #define CHECK_INTERVAL 180     /* 未运行桌面状态检查间隔(秒)，即3分钟 */
 #define MAX_RESP      65536    /* HTTP响应缓冲区大小(64KB) */
@@ -2744,7 +2752,7 @@ static int ws_connect(const char *uri, WSConn *wsc) {
     if (use_ssl && port == 80) port = 443;
 
     /* 创建WinHTTP会话 */
-    wsc->hSession = WinHttpOpen(L"CtYunKeepAlive/1.1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+    wsc->hSession = WinHttpOpen(L"CtYunKeepAlive/" APP_VERSION, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!wsc->hSession) {
         log_line("HTTP会话创建失败: %lu", GetLastError());
@@ -2940,45 +2948,41 @@ static DWORD WINAPI keep_alive_thread(LPVOID param) {
     ThreadParam *tp = (ThreadParam *)param;
     Desktop *d = tp->desktop;
 
+    uint8_t *ws_buf = (uint8_t *)malloc(4096);
+    if (!ws_buf) return 0;
+
     int cycle = 0;
     while (g_running) {
-        log_line("[%s] 正在连接...", d->desktop_code);
+        log_line("[%s] 正在连接 %s...", d->desktop_code, d->ws_uri ? d->ws_uri : "");
         WSConn wsc;
-        /* 使用预构建的ws_uri连接(保活阶段host/port已释放) */
         if (!ws_connect(d->ws_uri, &wsc)) {
             log_line("[%s] WebSocket连接失败，5秒后重试", d->desktop_code);
             Sleep(5000);
             continue;
         }
 
-        /* 发送连接消息(包含证书/密钥等认证信息) */
         ws_send_text(&wsc, d->connect_msg);
-        Sleep(500);
-        /* 发送初始REDQ协议载荷 */
+        Sleep(100);
         ws_send_bytes(&wsc, initial_payload, sizeof(initial_payload));
 
-        log_line("[%s] 已连接，保持60秒", d->desktop_code);
+        log_line("[%s] WebSocket已连接 %s，保持60秒", d->desktop_code, d->ws_uri ? d->ws_uri : "");
 
-        /* 维持连接60秒，处理REDQ认证请求 */
         DWORD start = GetTickCount();
         while (g_running && (GetTickCount() - start) < 60000) {
-            uint8_t buf[4096];
             int is_text;
-            int n = ws_recv(&wsc, buf, sizeof(buf), &is_text);
-            if (n < 0) break;    /* 连接断开 */
-            if (n == 0) continue; /* 无数据 */
-            /* 处理REDQ认证请求 */
-            if (!is_text && n >= 4 && memcmp(buf, "REDQ", 4) == 0) {
+            int n = ws_recv(&wsc, ws_buf, 4096, &is_text);
+            if (n < 0) break;
+            if (n == 0) continue;
+            if (!is_text && n >= 4 && memcmp(ws_buf, "REDQ", 4) == 0) {
                 log_line("[%s] 收到REDQ认证请求", d->desktop_code);
                 uint8_t resp[512]; size_t rlen = 0;
-                if (handle_redq(buf, n, resp, &rlen)) {
+                if (handle_redq(ws_buf, n, resp, &rlen)) {
                     ws_send_bytes(&wsc, resp, rlen);
                     log_line("[%s] REDQ认证响应成功", d->desktop_code);
                 }
             }
         }
 
-        /* 60秒到，断开重连 */
         ws_close(&wsc);
         log_line("[%s] 60秒完成，重新连接", d->desktop_code);
 
@@ -2988,6 +2992,7 @@ static DWORD WINAPI keep_alive_thread(LPVOID param) {
     }
 
     log_line("[%s] 线程退出", d->desktop_code);
+    free(ws_buf);
     return 0;
 }
 
@@ -3062,7 +3067,7 @@ static BOOL WINAPI ctrl_handler(DWORD type) {
  * usage - 显示用法帮助
  */
 static void usage(const char *exe) {
-    printf("天翼云电脑保活客户端 v1.1.0\n");
+    printf("天翼云电脑保活客户端 v" APP_VERSION "\n");
     printf("项目地址: https://github.com/DionZM/ctyun_keepalive_c\n\n");
     printf("用法: %s [选项]\n\n", exe);
     printf("选项:\n");
@@ -3097,7 +3102,7 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "/random") == 0 || strcmp(argv[i], "/r") == 0) {
             g_random = 1;
         } else if (strcmp(argv[i], "/version") == 0 || strcmp(argv[i], "/v") == 0) {
-            printf("版本 1.1.0\n");
+            printf("版本 " APP_VERSION "\n");
             return 0;
         } else if (strcmp(argv[i], "/help") == 0 || strcmp(argv[i], "/h") == 0 || strcmp(argv[i], "/?") == 0) {
             usage(argv[0]);
@@ -3127,7 +3132,7 @@ int main(int argc, char *argv[]) {
     crypto_init();
     http_init();
 
-    log_line("天翼云电脑保活 C 1.1.0");
+    log_line("天翼云电脑保活 V" APP_VERSION);
 
     /* 解析用户凭据(尝试自动解密config.json，失败则手动输入) */
     Session session = {0};
