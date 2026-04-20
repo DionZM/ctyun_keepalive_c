@@ -646,7 +646,6 @@ static int http_req(const char *method, const char *url, const char *body, size_
     URL_COMPONENTS uc = {0};
     uc.dwStructSize = sizeof(uc);
     WCHAR whostname[256], wurl_path[2048];
-    uc.lpszHostName = whostname; uc.dwHostNameLength = sizeof(whostname)/sizeof(WCHAR);
     uc.lpszUrlPath = wurl_path; uc.dwUrlPathLength = sizeof(wurl_path)/sizeof(WCHAR);
     WCHAR wurl[4096];
     MultiByteToWideChar(CP_ACP, 0, url, -1, wurl, 4096);
@@ -655,6 +654,7 @@ static int http_req(const char *method, const char *url, const char *body, size_
         return -1;
     }
     WCHAR wmethod[16] = {0};
+    uc.lpszHostName = whostname; uc.dwHostNameLength = sizeof(whostname)/sizeof(WCHAR);
     MultiByteToWideChar(CP_ACP, 0, method, -1, wmethod, 16);
 
     /* 建立到服务器的连接 */
@@ -2720,7 +2720,7 @@ typedef struct {
  * @param wsc  输出WebSocket连接句柄
  * @return     1=成功, 0=失败
  */
-static int ws_connect(const char *uri, WSConn *wsc) {
+static int ws_connect(const char *uri, WSConn *wsc, const char *desktop_code) {
     memset(wsc, 0, sizeof(WSConn));
     char host[256] = "", path[2048] = "/";
     int port = 443;
@@ -2755,7 +2755,7 @@ static int ws_connect(const char *uri, WSConn *wsc) {
     wsc->hSession = WinHttpOpen(L"CtYunKeepAlive/" APP_VERSION, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!wsc->hSession) {
-        log_line("HTTP会话创建失败: %lu", GetLastError());
+        log_line("[%s] HTTP会话创建失败: %lu", desktop_code, GetLastError());
         return 0;
     }
 
@@ -2764,7 +2764,7 @@ static int ws_connect(const char *uri, WSConn *wsc) {
     MultiByteToWideChar(CP_ACP, 0, host, -1, whost, 256);
     wsc->hConnect = WinHttpConnect(wsc->hSession, whost, (INTERNET_PORT)port, 0);
     if (!wsc->hConnect) {
-        log_line("HTTP连接失败: %lu", GetLastError());
+        log_line("[%s] HTTP连接失败: %lu", desktop_code, GetLastError());
         WinHttpCloseHandle(wsc->hSession);
         return 0;
     }
@@ -2776,7 +2776,7 @@ static int ws_connect(const char *uri, WSConn *wsc) {
     wsc->hRequest = WinHttpOpenRequest(wsc->hConnect, L"GET", wpath, NULL,
                                         WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!wsc->hRequest) {
-        log_line("HTTP请求创建失败: %lu", GetLastError());
+        log_line("[%s] HTTP请求创建失败: %lu", desktop_code, GetLastError());
         WinHttpCloseHandle(wsc->hConnect);
         WinHttpCloseHandle(wsc->hSession);
         return 0;
@@ -2797,7 +2797,7 @@ static int ws_connect(const char *uri, WSConn *wsc) {
 
     /* 设置WebSocket升级选项 */
     if (!WinHttpSetOption(wsc->hRequest, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0)) {
-        log_line("WebSocket升级选项设置失败: %lu", GetLastError());
+        log_line("[%s] WebSocket升级选项设置失败: %lu", desktop_code, GetLastError());
         WinHttpCloseHandle(wsc->hRequest);
         WinHttpCloseHandle(wsc->hConnect);
         WinHttpCloseHandle(wsc->hSession);
@@ -2807,7 +2807,7 @@ static int ws_connect(const char *uri, WSConn *wsc) {
     /* 发送HTTP升级请求 */
     if (!WinHttpSendRequest(wsc->hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                              WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
-        log_line("HTTP请求发送失败: %lu", GetLastError());
+        log_line("[%s] HTTP请求发送失败: %lu", desktop_code, GetLastError());
         WinHttpCloseHandle(wsc->hRequest);
         WinHttpCloseHandle(wsc->hConnect);
         WinHttpCloseHandle(wsc->hSession);
@@ -2816,7 +2816,7 @@ static int ws_connect(const char *uri, WSConn *wsc) {
 
     /* 接收服务端响应 */
     if (!WinHttpReceiveResponse(wsc->hRequest, NULL)) {
-        log_line("HTTP响应接收失败: %lu", GetLastError());
+        log_line("[%s] HTTP响应接收失败: %lu", desktop_code, GetLastError());
         WinHttpCloseHandle(wsc->hRequest);
         WinHttpCloseHandle(wsc->hConnect);
         WinHttpCloseHandle(wsc->hSession);
@@ -2829,7 +2829,7 @@ static int ws_connect(const char *uri, WSConn *wsc) {
     WinHttpQueryHeaders(wsc->hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                         NULL, &status_code, &sc_len, NULL);
     if (status_code != 101) {
-        log_line("WebSocket升级失败，状态码=%lu", status_code);
+        log_line("[%s] WebSocket升级失败，状态码=%lu", desktop_code, status_code);
         WinHttpCloseHandle(wsc->hRequest);
         WinHttpCloseHandle(wsc->hConnect);
         WinHttpCloseHandle(wsc->hSession);
@@ -2839,7 +2839,7 @@ static int ws_connect(const char *uri, WSConn *wsc) {
     /* 完成WebSocket升级 */
     wsc->hWebSocket = WinHttpWebSocketCompleteUpgrade(wsc->hRequest, (DWORD_PTR)NULL);
     if (!wsc->hWebSocket) {
-        log_line("WebSocket升级完成失败: %lu", GetLastError());
+        log_line("[%s] WebSocket升级完成失败: %lu", desktop_code, GetLastError());
         WinHttpCloseHandle(wsc->hRequest);
         WinHttpCloseHandle(wsc->hConnect);
         WinHttpCloseHandle(wsc->hSession);
@@ -2850,7 +2850,7 @@ static int ws_connect(const char *uri, WSConn *wsc) {
     WinHttpCloseHandle(wsc->hRequest);
     wsc->hRequest = NULL;
 
-    log_line("WebSocket握手成功");
+    log_line("[%s] WebSocket握手成功", desktop_code);
     return 1;
 }
 
@@ -2953,9 +2953,9 @@ static DWORD WINAPI keep_alive_thread(LPVOID param) {
 
     int cycle = 0;
     while (g_running) {
-        log_line("[%s] 正在连接 %s...", d->desktop_code, d->ws_uri ? d->ws_uri : "");
+        log_line("[%s] 正在连接...", d->desktop_code);
         WSConn wsc;
-        if (!ws_connect(d->ws_uri, &wsc)) {
+        if (!ws_connect(d->ws_uri, &wsc, d->desktop_code)) {
             log_line("[%s] WebSocket连接失败，5秒后重试", d->desktop_code);
             Sleep(5000);
             continue;
@@ -2965,7 +2965,7 @@ static DWORD WINAPI keep_alive_thread(LPVOID param) {
         Sleep(100);
         ws_send_bytes(&wsc, initial_payload, sizeof(initial_payload));
 
-        log_line("[%s] WebSocket已连接 %s，保持60秒", d->desktop_code, d->ws_uri ? d->ws_uri : "");
+        log_line("[%s] 已连接，保持60秒", d->desktop_code);
 
         DWORD start = GetTickCount();
         while (g_running && (GetTickCount() - start) < 60000) {
