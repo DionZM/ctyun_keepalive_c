@@ -646,6 +646,7 @@ static int http_req(const char *method, const char *url, const char *body, size_
     URL_COMPONENTS uc = {0};
     uc.dwStructSize = sizeof(uc);
     WCHAR whostname[256], wurl_path[2048];
+    uc.lpszHostName = whostname; uc.dwHostNameLength = sizeof(whostname)/sizeof(WCHAR);
     uc.lpszUrlPath = wurl_path; uc.dwUrlPathLength = sizeof(wurl_path)/sizeof(WCHAR);
     WCHAR wurl[4096];
     MultiByteToWideChar(CP_ACP, 0, url, -1, wurl, 4096);
@@ -654,7 +655,6 @@ static int http_req(const char *method, const char *url, const char *body, size_
         return -1;
     }
     WCHAR wmethod[16] = {0};
-    uc.lpszHostName = whostname; uc.dwHostNameLength = sizeof(whostname)/sizeof(WCHAR);
     MultiByteToWideChar(CP_ACP, 0, method, -1, wmethod, 16);
 
     /* 建立到服务器的连接 */
@@ -2774,7 +2774,7 @@ static int ws_connect(const char *uri, WSConn *wsc, const char *desktop_code) {
     MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, 2048);
     DWORD flags = use_ssl ? WINHTTP_FLAG_SECURE : 0;
     wsc->hRequest = WinHttpOpenRequest(wsc->hConnect, L"GET", wpath, NULL,
-                                        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+                                  WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!wsc->hRequest) {
         log_line("[%s] HTTP请求创建失败: %lu", desktop_code, GetLastError());
         WinHttpCloseHandle(wsc->hConnect);
