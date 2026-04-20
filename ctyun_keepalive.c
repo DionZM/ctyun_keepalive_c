@@ -13,9 +13,9 @@
  *   - 预构建ws_uri，保活阶段释放host/port/clink_host等连接参数
  *
  * 编译 (MSVC x64):
- *   cl /O2 /MD /GS- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS ctyun_keepalive.c ^
+ *   cl /O2 /MD /GS- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8 ctyun_keepalive.c ^
  *      /link /SUBSYSTEM:CONSOLE /STACK:131072,131072 /OPT:REF /OPT:ICF ^
- *      winhttp.lib ws2_32.lib crypt32.lib advapi32.lib iphlpapi.lib bcrypt.lib
+ *      winhttp.lib ws2_32.lib crypt32.lib advapi32.lib iphlpapi.lib bcrypt.lib ole32.lib windowscodecs.lib user32.lib gdi32.lib
  *
  * 版本: 1.1.0
  */
@@ -35,6 +35,8 @@
 #include <winhttp.h>       /* WinHTTP (HTTP/WebSocket客户端) */
 #include <bcrypt.h>        /* CNG API (RSA-OAEP加密) */
 #include <iphlpapi.h>      /* 网络适配器信息 (GetAdaptersInfo) */
+#include <ole2.h>           /* COM (CreateStreamOnHGlobal) */
+#include <wincodec.h>       /* WIC (图像解码) */
 
 /* CryptoAPI中SHA-256算法标识符，部分SDK版本未定义，手动补充 */
 #ifndef CALG_SHA_256
@@ -48,6 +50,10 @@
 #pragma comment(lib, "advapi32.lib")   /* 高级API: 注册表/安全 */
 #pragma comment(lib, "iphlpapi.lib")   /* IP Helper: 网卡信息 */
 #pragma comment(lib, "bcrypt.lib")     /* CNG: 现代加密算法 */
+#pragma comment(lib, "ole32.lib")      /* COM: CreateStreamOnHGlobal */
+#pragma comment(lib, "windowscodecs.lib") /* WIC: 图像解码 */
+#pragma comment(lib, "user32.lib")      /* 窗口管理: CreateWindowExW */
+#pragma comment(lib, "gdi32.lib")       /* GDI: CreateDIBSection, StretchBlt */
 
 /* ======================== 常量定义 ======================== */
 #define MAX_DESKTOPS  10       /* 最大桌面数量 */
@@ -82,6 +88,8 @@ static volatile LONG g_bg_switch = 0;
 
 static int g_privacy = 0;
 
+static int g_random = 0;
+
 /* ======================== 工具函数 ======================== */
 
 /**
@@ -106,7 +114,7 @@ static void refresh_banner(void) {
     DWORD written;
     FillConsoleOutputCharacterW(hOut, L' ', csbi.dwSize.X, pos, &written);
     FillConsoleOutputAttribute(hOut, attr, csbi.dwSize.X, pos, &written);
-    const char *banner_utf8 = "  \xe3\x80\x90\xe5\xbc\x80\xe6\xba\x90\xe8\xbd\xaf\xe4\xbb\xb6\xe3\x80\x91https://github.com/DionZM/ctyun_keepalive_c  Ctrl+C\xe9\x80\x80\xe5\x87\xba Ctrl+B\xe8\xbd\xac\xe5\x90\x8e\xe5\x8f\xb0  ";
+    const char *banner_utf8 = "\x20\x20\xe3\x80\x90\xe5\xbc\x80\xe6\xba\x90\xe8\xbd\xaf\xe4\xbb\xb6\xe3\x80\x91\x68\x74\x74\x70\x73\x3a\x2f\x2f\x67\x69\x74\x68\x75\x62\x2e\x63\x6f\x6d\x2f\x44\x69\x6f\x6e\x5a\x4d\x2f\x63\x74\x79\x75\x6e\x5f\x6b\x65\x65\x70\x61\x6c\x69\x76\x65\x5f\x63\x20\x20\x43\x74\x72\x6c\x2b\x43\xe9\x80\x80\xe5\x87\xba\x20\x43\x74\x72\x6c\x2b\x42\xe8\xbd\xac\xe5\x90\x8e\xe5\x8f\xb0\x20\x20";
     WCHAR wbanner[128];
     int wlen = MultiByteToWideChar(CP_UTF8, 0, banner_utf8, -1, wbanner, 128);
     if (wlen > 0) WriteConsoleOutputCharacterW(hOut, wbanner, wlen - 1, pos, &written);
@@ -423,6 +431,17 @@ static int jint(const char *j, const char *k) {
     return atoi(p);
 }
 
+static int jbool(const char *j, const char *k) {
+    char srch[128];
+    snprintf(srch, sizeof(srch), "\"%s\"", k);
+    const char *p = strstr(j, srch);
+    if (!p) return 0;
+    p += strlen(srch);
+    while (*p == ' ' || *p == ':') p++;
+    if (*p == 't') return 1;
+    return 0;
+}
+
 /**
  * str_dup - 堆上复制字符串
  *
@@ -493,9 +512,12 @@ typedef struct {
     char device_code[128];    /* 设备标识(如 web_a1b2c3d4...) */
     char secret_key[128];     /* 登录后获取的签名密钥 */
     char user_name[128];      /* 用户名(登录后清零) */
+    char user_account[128];   /* 用户账号(API返回) */
+    char phone_number[128];   /* 用户输入的手机号(用于发送短信验证码) */
     int user_id;              /* 用户ID */
     int tenant_id;            /* 租户ID */
     int logged_in;            /* 是否已登录 */
+    int bonded_device;        /* 设备是否已绑定(0=未绑定,1=已绑定) */
 } Session;
 
 /* ======================== Desktop内存管理 ======================== */
@@ -621,7 +643,7 @@ static int http_req(const char *method, const char *url, const char *body, size_
     WCHAR wurl[4096];
     MultiByteToWideChar(CP_ACP, 0, url, -1, wurl, 4096);
     if (!WinHttpCrackUrl(wurl, 0, 0, &uc)) {
-        log_line("URL parse failed: %s", url);
+        log_line("URL解析失败: %s", url);
         return -1;
     }
     WCHAR wmethod[16] = {0};
@@ -632,7 +654,7 @@ static int http_req(const char *method, const char *url, const char *body, size_
     if (!hconn) {
         char hname[256];
         WideCharToMultiByte(CP_ACP, 0, whostname, -1, hname, sizeof(hname), NULL, NULL);
-        log_line("WinHttpConnect failed for %s:%d err=%lu", hname, uc.nPort, GetLastError());
+        log_line("连接服务器失败: %s:%d 错误=%lu", hname, uc.nPort, GetLastError());
         return -1;
     }
 
@@ -642,7 +664,7 @@ static int http_req(const char *method, const char *url, const char *body, size_
     HINTERNET hreq = WinHttpOpenRequest(hconn, wmethod, wurl_path, NULL, WINHTTP_NO_REFERER,
                                          WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!hreq) {
-        log_line("WinHttpOpenRequest failed err=%lu", GetLastError());
+        log_line("创建HTTP请求失败: 错误=%lu", GetLastError());
         WinHttpCloseHandle(hconn);
         return -1;
     }
@@ -670,14 +692,14 @@ static int http_req(const char *method, const char *url, const char *body, size_
 
     /* 发送请求 */
     if (!WinHttpSendRequest(hreq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, (void *)body, (DWORD)blen, (DWORD)blen, 0)) {
-        log_line("WinHttpSendRequest failed err=%lu", GetLastError());
+        log_line("发送HTTP请求失败: 错误=%lu", GetLastError());
         WinHttpCloseHandle(hreq); WinHttpCloseHandle(hconn);
         return -1;
     }
 
     /* 接收响应 */
     if (!WinHttpReceiveResponse(hreq, NULL)) {
-        log_line("WinHttpReceiveResponse failed err=%lu", GetLastError());
+        log_line("接收HTTP响应失败: 错误=%lu", GetLastError());
         WinHttpCloseHandle(hreq); WinHttpCloseHandle(hconn);
         return -1;
     }
@@ -868,51 +890,308 @@ static int api_post(const Session *s, const char *url, const char *body, size_t 
     return http_req("POST", url, body, blen, ct, hdrs, nhdrs, resp, rsz);
 }
 
+static int api_get(const Session *s, const char *url, char *resp, size_t rsz) {
+    const char *hdrs[16];
+    int nhdrs = 0;
+    make_sig_headers(s, hdrs, &nhdrs);
+    return http_req("GET", url, NULL, 0, NULL, hdrs, nhdrs, resp, rsz);
+}
+
+static int api_get_binary(const Session *s, const char *url, uint8_t *resp, size_t rsz) {
+    const char *hdrs[16];
+    int nhdrs = 0;
+    make_sig_headers(s, hdrs, &nhdrs);
+    return http_get_binary(url, hdrs, nhdrs, resp, rsz);
+}
+
+/* ======================== 验证码图片窗口显示 ======================== */
+
+static HWND g_captcha_hwnd = NULL;
+static HBITMAP g_captcha_hbm = NULL;
+static volatile LONG g_captcha_wnd_ready = 0;
+
+static LRESULT CALLBACK captcha_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        HBITMAP hbm = (HBITMAP)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+        if (hbm) {
+            BITMAP bm;
+            GetObjectW(hbm, sizeof(bm), &bm);
+            HDC memdc = CreateCompatibleDC(hdc);
+            HBITMAP old = (HBITMAP)SelectObject(memdc, hbm);
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            SetStretchBltMode(hdc, HALFTONE);
+            StretchBlt(hdc, 0, 0, rc.right, rc.bottom,
+                       memdc, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
+            SelectObject(memdc, old);
+            DeleteDC(memdc);
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_DESTROY:
+        g_captcha_hwnd = NULL;
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static DWORD WINAPI captcha_wnd_thread(LPVOID param) {
+    (void)param;
+    HRESULT hr = CoInitialize(NULL);
+    int need_com_uninit = SUCCEEDED(hr);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+        InterlockedExchange(&g_captcha_wnd_ready, 2);
+        return 0;
+    }
+
+    HBITMAP hbm = (HBITMAP)InterlockedCompareExchangePointer((PVOID *)&g_captcha_hbm, NULL, NULL);
+    hbm = g_captcha_hbm;
+
+    static int registered = 0;
+    if (!registered) {
+        WNDCLASSW wc = {0};
+        wc.lpfnWndProc = captcha_wnd_proc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.lpszClassName = L"CaptchaWnd";
+        RegisterClassW(&wc);
+        registered = 1;
+    }
+
+    BITMAP bm;
+    GetObjectW(hbm, sizeof(bm), &bm);
+    int scale = 500 / bm.bmWidth;
+    if (scale < 2) scale = 2;
+    if (scale > 10) scale = 10;
+    int win_w = bm.bmWidth * scale;
+    int win_h = bm.bmHeight * scale;
+
+    RECT rc = {0, 0, win_w, win_h};
+    AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, FALSE);
+    int scr_w = GetSystemMetrics(SM_CXSCREEN);
+    int scr_h = GetSystemMetrics(SM_CYSCREEN);
+    int x = (scr_w - (rc.right - rc.left)) / 2;
+    int y = (scr_h - (rc.bottom - rc.top)) / 2;
+
+    HWND hwnd = CreateWindowExW(WS_EX_TOPMOST, L"CaptchaWnd",
+                                 L"验证码 (请手工输入后回到命令行)",
+                                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+                                 x, y, rc.right - rc.left, rc.bottom - rc.top,
+                                 NULL, NULL, GetModuleHandleW(NULL), NULL);
+    if (hwnd) {
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)hbm);
+        ShowWindow(hwnd, SW_SHOW);
+        UpdateWindow(hwnd);
+        g_captcha_hwnd = hwnd;
+        InterlockedExchange(&g_captcha_wnd_ready, 1);
+
+        MSG msg;
+        while (GetMessageW(&msg, NULL, 0, 0)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    } else {
+        InterlockedExchange(&g_captcha_wnd_ready, 2);
+    }
+
+    if (need_com_uninit) CoUninitialize();
+    return 0;
+}
+
+static HBITMAP decode_image_to_hbitmap(const uint8_t *img_data, int img_len) {
+    HBITMAP result = NULL;
+    HRESULT hr = CoInitialize(NULL);
+    int need_com_uninit = SUCCEEDED(hr);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) return NULL;
+
+    IWICImagingFactory *factory = NULL;
+    hr = CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+                          &IID_IWICImagingFactory, (void **)&factory);
+    if (FAILED(hr)) goto done;
+
+    {
+        IStream *stream = NULL;
+        hr = CreateStreamOnHGlobal(NULL, TRUE, &stream);
+        if (FAILED(hr)) goto factory_done;
+
+        ULONG cb_written = 0;
+        stream->lpVtbl->Write(stream, img_data, (ULONG)img_len, &cb_written);
+        LARGE_INTEGER li_zero;
+        li_zero.QuadPart = 0;
+        stream->lpVtbl->Seek(stream, li_zero, STREAM_SEEK_SET, NULL);
+
+        IWICBitmapDecoder *decoder = NULL;
+        hr = factory->lpVtbl->CreateDecoderFromStream(factory, stream, NULL,
+                                                      WICDecodeMetadataCacheOnDemand, &decoder);
+        if (FAILED(hr)) { stream->lpVtbl->Release(stream); goto factory_done; }
+
+        IWICBitmapFrameDecode *frame = NULL;
+        hr = decoder->lpVtbl->GetFrame(decoder, 0, &frame);
+        if (FAILED(hr)) { decoder->lpVtbl->Release(decoder); stream->lpVtbl->Release(stream); goto factory_done; }
+
+        UINT w = 0, h = 0;
+        frame->lpVtbl->GetSize(frame, &w, &h);
+        if (w == 0 || h == 0) {
+            frame->lpVtbl->Release(frame); decoder->lpVtbl->Release(decoder);
+            stream->lpVtbl->Release(stream); goto factory_done;
+        }
+
+        IWICFormatConverter *conv = NULL;
+        hr = factory->lpVtbl->CreateFormatConverter(factory, &conv);
+        if (FAILED(hr)) {
+            frame->lpVtbl->Release(frame); decoder->lpVtbl->Release(decoder);
+            stream->lpVtbl->Release(stream); goto factory_done;
+        }
+
+        hr = conv->lpVtbl->Initialize(conv, (IWICBitmapSource *)frame,
+                                      &GUID_WICPixelFormat32bppBGRA,
+                                      WICBitmapDitherTypeNone, NULL, 0.0,
+                                      WICBitmapPaletteTypeCustom);
+        if (FAILED(hr)) {
+            conv->lpVtbl->Release(conv); frame->lpVtbl->Release(frame);
+            decoder->lpVtbl->Release(decoder); stream->lpVtbl->Release(stream);
+            goto factory_done;
+        }
+
+        UINT stride = w * 4;
+        UINT buf_sz = stride * h;
+        uint8_t *px = (uint8_t *)malloc(buf_sz);
+        if (!px) {
+            conv->lpVtbl->Release(conv); frame->lpVtbl->Release(frame);
+            decoder->lpVtbl->Release(decoder); stream->lpVtbl->Release(stream);
+            goto factory_done;
+        }
+
+        hr = conv->lpVtbl->CopyPixels(conv, NULL, stride, buf_sz, px);
+        if (FAILED(hr)) {
+            free(px); conv->lpVtbl->Release(conv); frame->lpVtbl->Release(frame);
+            decoder->lpVtbl->Release(decoder); stream->lpVtbl->Release(stream);
+            goto factory_done;
+        }
+
+        for (UINT i = 0; i < buf_sz; i += 4) px[i + 3] = 0xFF;
+
+        BITMAPINFO bmi = {0};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = (LONG)w;
+        bmi.bmiHeader.biHeight = -(LONG)h;
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+
+        HDC screen_dc = GetDC(NULL);
+        void *bits = NULL;
+        result = CreateDIBSection(screen_dc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+        ReleaseDC(NULL, screen_dc);
+        if (result && bits) memcpy(bits, px, buf_sz);
+        free(px);
+
+        conv->lpVtbl->Release(conv);
+        frame->lpVtbl->Release(frame);
+        decoder->lpVtbl->Release(decoder);
+        stream->lpVtbl->Release(stream);
+    }
+
+factory_done:
+    factory->lpVtbl->Release(factory);
+done:
+    if (need_com_uninit) CoUninitialize();
+    return result;
+}
+
+static void show_captcha_window(const uint8_t *img_data, int img_len) {
+    if (g_background || !img_data || img_len <= 0) return;
+    if (g_captcha_hwnd) return;
+
+    g_captcha_hbm = decode_image_to_hbitmap(img_data, img_len);
+    if (!g_captcha_hbm) return;
+
+    InterlockedExchange(&g_captcha_wnd_ready, 0);
+    CreateThread(NULL, THREAD_STACK, captcha_wnd_thread, NULL, 0, NULL);
+
+    while (!InterlockedCompareExchange(&g_captcha_wnd_ready, 0, 0)) Sleep(20);
+}
+
+static void close_captcha_window(void) {
+    if (g_captcha_hwnd) {
+        PostMessageW(g_captcha_hwnd, WM_CLOSE, 0, 0);
+        g_captcha_hwnd = NULL;
+    }
+    Sleep(100);
+    if (g_captcha_hbm) {
+        DeleteObject(g_captcha_hbm);
+        g_captcha_hbm = NULL;
+    }
+}
+
+static int read_manual_captcha(char *out, size_t out_sz) {
+    printf("验证码自动识别失败，请手工输入："); fflush(stdout);
+    if (!fgets(out, (int)out_sz, stdin)) return 0;
+    out[strcspn(out, "\r\n")] = 0;
+    return out[0] ? 1 : 0;
+}
+
 /* ======================== 验证码OCR ======================== */
 
 /**
- * get_captcha_ocr - 获取验证码图片并OCR识别
+ * try_captcha_ocr - 下载验证码图片并尝试OCR识别
  *
- * 流程:
- * 1. 从天翼云API下载验证码图片(二进制)
- * 2. 将图片Base64编码
- * 3. 构建multipart/form-data请求体
- * 4. 发送到第三方OCR服务(orc.1999111.xyz)识别
- * 5. 返回识别结果
+ * 先下载图片，再尝试OCR。返回值区分下载失败、OCR技术失败、OCR成功。
+ * OCR成功时captcha_out填入结果；OCR技术失败时img_out保留图片数据供手工输入。
  *
  * @param s            会话信息
- * @param user         用户名(用于验证码URL参数)
+ * @param user         用户名(登录验证码用, 短信验证码传NULL)
  * @param captcha_out  输出验证码文本
  * @param co_sz        输出缓冲区大小
- * @return             1=成功, 0=失败
+ * @param img_out      输出图片数据(需调用者free)
+ * @param img_len_out  输出图片数据长度
+ * @return             2=OCR成功, 1=OCR技术失败(图片已下载), 0=下载失败
  */
-static int get_captcha_ocr(const Session *s, const char *user, char *captcha_out, size_t co_sz) {
-    /* 构建验证码图片URL，带时间戳防缓存 */
+static int try_captcha_ocr(const Session *s, const char *user,
+                           char *captcha_out, size_t co_sz,
+                           uint8_t **img_out, int *img_len_out) {
     char captcha_url[512];
     long long t = (long long)time(NULL) * 1000LL;
-    snprintf(captcha_url, sizeof(captcha_url),
-             "https://desk.ctyun.cn:8810/api/auth/client/captcha?height=36&width=85&userInfo=%s&mode=auto&_t=%lld",
-             user, t);
 
-    /* 下载验证码图片 */
-    const char *hdrs[16];
-    int nhdrs = 0;
-    make_base_headers(s, hdrs, &nhdrs);
+    if (user) {
+        snprintf(captcha_url, sizeof(captcha_url),
+                 "https://desk.ctyun.cn:8810/api/auth/client/captcha?height=36&width=85&userInfo=%s&mode=auto&_t=%lld",
+                 user, t);
+    } else {
+        snprintf(captcha_url, sizeof(captcha_url),
+                 "https://desk.ctyun.cn:8810/api/auth/client/validateCode/captcha?width=120&height=40&_t=%lld", t);
+    }
+
     uint8_t *img = (uint8_t *)malloc(65536);
-    int img_len = http_get_binary(captcha_url, hdrs, nhdrs, img, 65536);
+    int img_len;
+    if (user) {
+        const char *hdrs[16];
+        int nhdrs = 0;
+        make_base_headers(s, hdrs, &nhdrs);
+        img_len = http_get_binary(captcha_url, hdrs, nhdrs, img, 65536);
+    } else {
+        img_len = api_get_binary(s, captcha_url, img, 65536);
+    }
     if (img_len <= 0) {
-        log_line("captcha image download failed");
+        log_line("验证码图片下载失败");
         free(img);
         return 0;
     }
-    log_line("captcha image size: %d bytes", img_len);
 
-    /* 将图片Base64编码 */
+    *img_out = img;
+    *img_len_out = img_len;
+
     char *img_b64 = (char *)malloc(img_len * 2 + 4);
     b64enc(img, img_len, img_b64);
-    free(img);
 
-    /* 构建multipart/form-data请求体 */
     char boundary[64];
     snprintf(boundary, sizeof(boundary), "----ctyun%08x", (unsigned)GetTickCount());
     size_t b64len = strlen(img_b64);
@@ -926,7 +1205,6 @@ static int get_captcha_ocr(const Session *s, const char *user, char *captcha_out
         boundary, img_b64, boundary);
     free(img_b64);
 
-    /* 设置Content-Type和请求头 */
     char ct_hdr[256];
     snprintf(ct_hdr, sizeof(ct_hdr), "multipart/form-data; boundary=%s", boundary);
     char h_dc[128], h1[64], h2[64], h5[64];
@@ -935,26 +1213,23 @@ static int get_captcha_ocr(const Session *s, const char *user, char *captcha_out
     snprintf(h_dc, sizeof(h_dc), "ctg-devicecode: %s", s->device_code);
     snprintf(h5, sizeof(h5), "referer: https://pc.ctyun.cn/");
 
-    /* 发送OCR请求(需携带天翼云基础请求头，否则OCR服务可能拒绝) */
     const char *ocr_hdrs[] = { h1, h2, h_dc, h5 };
     char orc_resp[4096];
     int rlen = http_req("POST", "https://orc.1999111.xyz/ocr", body, blen, ct_hdr, ocr_hdrs, 4, orc_resp, sizeof(orc_resp));
     free(body);
     if (rlen <= 0) {
-        log_line("OCR request failed");
-        return 0;
+        log_line("OCR接口连接失败");
+        return 1;
     }
     orc_resp[rlen] = 0;
-    log_line("OCR response: %s", orc_resp);
 
-    /* 提取OCR识别结果 */
     jstr(orc_resp, "data", captcha_out, co_sz);
     if (!captcha_out[0]) {
-        log_line("OCR result empty");
-        return 0;
+        log_line("OCR识别结果为空");
+        return 1;
     }
-    log_line("OCR result: %s", captcha_out);
-    return 1;
+    log_line("OCR识别结果: %s", captcha_out);
+    return 2;
 }
 
 /* ======================== 登录流程 ======================== */
@@ -962,72 +1237,156 @@ static int get_captcha_ocr(const Session *s, const char *user, char *captcha_out
 /**
  * do_login - 执行天翼云电脑登录
  *
- * 登录流程(最多重试3次):
+ * 登录流程:
  * 1. 调用genChallengeData获取挑战码(challengeId + challengeCode)
- * 2. 下载验证码图片并OCR识别
- * 3. 计算密码哈希: SHA256(密码+challengeCode) 和 SHA256(SHA256(密码)+challengeCode)
- * 4. URL编码challengeId和deviceCode
- * 5. 构建登录请求体并发送
- * 6. 解析响应获取secretKey/userId/tenantId
+ * 2. 下载验证码图片并优先OCR识别
+ * 3. OCR失败或连续3次自动识别验证失败时，弹出窗口手工输入
+ * 4. 计算密码哈希: SHA256(密码+challengeCode) 和 SHA256(SHA256(密码)+challengeCode)
+ * 5. URL编码challengeId和deviceCode
+ * 6. 构建登录请求体并发送
+ * 7. 解析响应获取secretKey/userId/tenantId
  *
- * 密码哈希说明:
- *   - password: SHA256(原始密码 + challengeCode)，服务端用此验证
- *   - sha256Password: SHA256(SHA256(原始密码) + challengeCode)，双重哈希增强安全性
+ * 手工输入验证码时，连续3次失败则输出"验证码识别错误"并退出程序。
  *
  * @param s     会话信息(输出secretKey/userId/tenantId)
  * @param user  用户名
  * @param pwd   原始密码
- * @return      1=登录成功, 0=登录失败
+ * @return      1=登录成功, 0=登录失败(不返回: 手工3次失败直接退出)
  */
 static int do_login(Session *s, const char *user, const char *pwd) {
+    int auto_fail_count = 0;
     for (int attempt = 1; attempt <= 3; attempt++) {
         char resp[MAX_RESP];
 
-        /* 第一步: 获取挑战码 */
         if (api_post_noauth(s, "https://desk.ctyun.cn:8810/api/auth/client/genChallengeData",
                             "{}", 2, "application/json", resp, sizeof(resp)) < 0) {
-            log_line("getChallenge failed (attempt %d)", attempt);
+            log_line("获取挑战码失败 (尝试%d)", attempt);
             continue;
         }
         int code = jint(resp, "code");
-        log_line("challenge resp code=%d", code);
+        log_line("挑战码响应: code=%d", code);
         if (code != 0) {
             char msg[256];
             jstr(resp, "msg", msg, sizeof(msg));
-            log_line("challenge error: %s", msg);
+            log_line("获取挑战码错误: %s", msg);
             continue;
         }
         char cid[128], ccode[128];
         jstr(resp, "challengeId", cid, sizeof(cid));
         jstr(resp, "challengeCode", ccode, sizeof(ccode));
-        if (!cid[0]) { log_line("challenge empty"); continue; }
-        log_line("challengeId=%s", cid);
+        if (!cid[0]) { log_line("挑战码为空"); continue; }
 
-        /* 第二步: OCR识别验证码 */
         char captcha[64] = "";
-        if (!get_captcha_ocr(s, user, captcha, sizeof(captcha))) {
-            log_line("captcha OCR failed (attempt %d)", attempt);
-            continue;
+        uint8_t *img_data = NULL;
+        int img_len = 0;
+        int ocr_result = try_captcha_ocr(s, user, captcha, sizeof(captcha), &img_data, &img_len);
+
+        if (ocr_result == 2) {
+            auto_fail_count++;
         }
 
-        /* 第三步: 计算密码哈希 */
+        if (ocr_result < 2 || auto_fail_count >= 3) {
+            if (img_data && img_len > 0) {
+                show_captcha_window(img_data, img_len);
+            }
+            log_line("验证码自动识别失败，切换手工输入模式");
+            int manual_fail = 0;
+            while (manual_fail < 3) {
+                captcha[0] = 0;
+                if (!read_manual_captcha(captcha, sizeof(captcha))) {
+                    log_line("手工输入为空");
+                    manual_fail++;
+                    continue;
+                }
+                close_captcha_window();
+
+                char combined[512], final_sha[65];
+                snprintf(combined, sizeof(combined), "%s%s", pwd, ccode);
+                sha256_hex(combined, final_sha);
+
+                char pwd_sha[65];
+                sha256_hex(pwd, pwd_sha);
+
+                char sha2_combined[512], sha2_pwd[65];
+                snprintf(sha2_combined, sizeof(sha2_combined), "%s%s", pwd_sha, ccode);
+                sha256_hex(sha2_combined, sha2_pwd);
+
+                char enc_cid[512], enc_dc[512];
+                url_encode(cid, enc_cid, sizeof(enc_cid));
+                url_encode(s->device_code, enc_dc, sizeof(enc_dc));
+
+                char post[4096];
+                snprintf(post, sizeof(post),
+                         "userAccount=%s&password=%s&sha256Password=%s&challengeId=%s&captchaCode=%s"
+                         "&deviceCode=%s&deviceName=Chrome%%E6%%B5%%8F%%E8%%A7%%88%%E5%%99%%A8&deviceType=60"
+                         "&deviceModel=Windows+NT+10.0%%3B+Win64%%3B+x64&appVersion=3.2.0"
+                         "&sysVersion=Windows+NT+10.0%%3B+Win64%%3B+x64&clientVersion=103020001",
+                         user, final_sha, sha2_pwd, enc_cid, captcha, enc_dc);
+
+                log_line("正在发送登录请求 (手工验证码, 尝试%d)...", manual_fail + 1);
+                if (api_post_noauth(s, "https://desk.ctyun.cn:8810/api/auth/client/login",
+                                    post, strlen(post), "application/x-www-form-urlencoded",
+                                    resp, sizeof(resp)) < 0) {
+                    log_line("登录请求发送失败");
+                    manual_fail++;
+                    continue;
+                }
+
+                code = jint(resp, "code");
+                log_line("登录响应: code=%d", code);
+                if (code != 0) {
+                    char msg[256];
+                    jstr(resp, "msg", msg, sizeof(msg));
+                    log_line("登录失败: %s", msg);
+                    if (strcmp(msg, "\xe7\x94\xa8\xe6\x88\xb7\xe5\x90\x8d\xe6\x88\x96\xe5\xaf\x86\xe7\xa0\x81\xe9\x94\x99\xe8\xaf\xaf") == 0) {
+                        close_captcha_window();
+                        if (img_data) free(img_data);
+                        return 0;
+                    }
+                    manual_fail++;
+                    continue;
+                }
+
+                const char *p = strstr(resp, "\"data\"");
+                if (!p) { log_line("响应中无data字段"); manual_fail++; continue; }
+                p = strchr(p, '{');
+                if (!p) { log_line("data字段格式错误"); manual_fail++; continue; }
+
+                jstr(p, "secretKey", s->secret_key, sizeof(s->secret_key));
+                jstr(p, "userName", s->user_name, sizeof(s->user_name));
+                jstr(p, "userAccount", s->user_account, sizeof(s->user_account));
+                s->user_id = jint(p, "userId");
+                s->tenant_id = jint(p, "tenantId");
+                s->bonded_device = jbool(p, "bondedDevice");
+                log_line("登录成功: userId=%d, tenantId=%d, bondedDevice=%d", s->user_id, s->tenant_id, s->bonded_device);
+                s->logged_in = s->secret_key[0] ? 1 : 0;
+                if (img_data) free(img_data);
+                return s->logged_in;
+            }
+            close_captcha_window();
+            if (img_data) free(img_data);
+            log_line("验证码识别错误");
+            InterlockedExchange(&g_running, 0);
+            return 0;
+        }
+
+        if (img_data) { free(img_data); img_data = NULL; }
+
         char combined[512], final_sha[65];
         snprintf(combined, sizeof(combined), "%s%s", pwd, ccode);
-        sha256_hex(combined, final_sha);  /* password字段 */
+        sha256_hex(combined, final_sha);
 
         char pwd_sha[65];
-        sha256_hex(pwd, pwd_sha);  /* 原始密码的SHA256 */
+        sha256_hex(pwd, pwd_sha);
 
         char sha2_combined[512], sha2_pwd[65];
         snprintf(sha2_combined, sizeof(sha2_combined), "%s%s", pwd_sha, ccode);
-        sha256_hex(sha2_combined, sha2_pwd);  /* sha256Password字段 */
+        sha256_hex(sha2_combined, sha2_pwd);
 
-        /* 第四步: URL编码特殊字符 */
         char enc_cid[512], enc_dc[512];
         url_encode(cid, enc_cid, sizeof(enc_cid));
         url_encode(s->device_code, enc_dc, sizeof(enc_dc));
 
-        /* 第五步: 构建并发送登录请求 */
         char post[4096];
         snprintf(post, sizeof(post),
                  "userAccount=%s&password=%s&sha256Password=%s&challengeId=%s&captchaCode=%s"
@@ -1036,43 +1395,187 @@ static int do_login(Session *s, const char *user, const char *pwd) {
                  "&sysVersion=Windows+NT+10.0%%3B+Win64%%3B+x64&clientVersion=103020001",
                  user, final_sha, sha2_pwd, enc_cid, captcha, enc_dc);
 
-        log_line("login request sending (attempt %d)...", attempt);
+        log_line("正在发送登录请求 (尝试%d)...", attempt);
         if (api_post_noauth(s, "https://desk.ctyun.cn:8810/api/auth/client/login",
                             post, strlen(post), "application/x-www-form-urlencoded",
                             resp, sizeof(resp)) < 0) {
-            log_line("login request failed");
+            log_line("登录请求发送失败");
             continue;
         }
 
-        /* 第六步: 解析登录响应 */
         code = jint(resp, "code");
-        log_line("login resp code=%d", code);
+        log_line("登录响应: code=%d", code);
         if (code != 0) {
             char msg[256];
             jstr(resp, "msg", msg, sizeof(msg));
-            log_line("login failed: %s", msg);
-            /* "用户名或密码错误"(UTF-8)则不再重试 */
+            log_line("登录失败: %s", msg);
             if (strcmp(msg, "\xe7\x94\xa8\xe6\x88\xb7\xe5\x90\x8d\xe6\x88\x96\xe5\xaf\x86\xe7\xa0\x81\xe9\x94\x99\xe8\xaf\xaf") == 0)
                 return 0;
             continue;
         }
 
-        /* 提取data对象中的认证信息 */
         const char *p = strstr(resp, "\"data\"");
-        if (!p) { log_line("no data in response"); continue; }
+        if (!p) { log_line("响应中无data字段"); continue; }
         p = strchr(p, '{');
-        if (!p) { log_line("no { in data"); continue; }
+        if (!p) { log_line("data字段格式错误"); continue; }
 
         jstr(p, "secretKey", s->secret_key, sizeof(s->secret_key));
         jstr(p, "userName", s->user_name, sizeof(s->user_name));
+        jstr(p, "userAccount", s->user_account, sizeof(s->user_account));
         s->user_id = jint(p, "userId");
         s->tenant_id = jint(p, "tenantId");
-        log_line("secretKey=%s, userId=%d, tenantId=%d", s->secret_key, s->user_id, s->tenant_id);
+        s->bonded_device = jbool(p, "bondedDevice");
+        log_line("登录成功: userId=%d, tenantId=%d, bondedDevice=%d", s->user_id, s->tenant_id, s->bonded_device);
         s->logged_in = s->secret_key[0] ? 1 : 0;
         return s->logged_in;
     }
-    log_line("login failed after 3 attempts");
+    log_line("登录失败，已重试3次");
     return 0;
+}
+
+/* ======================== 短信验证码与设备绑定 ======================== */
+
+static int send_sms_code(const Session *s, const char *phone) {
+    int auto_fail_count = 0;
+    for (int i = 0; i < 3; i++) {
+        char captcha[64] = "";
+        uint8_t *img_data = NULL;
+        int img_len = 0;
+        int ocr_result = try_captcha_ocr(s, NULL, captcha, sizeof(captcha), &img_data, &img_len);
+
+        if (ocr_result == 2) {
+            auto_fail_count++;
+        }
+
+        if (ocr_result < 2 || auto_fail_count >= 3) {
+            if (img_data && img_len > 0) {
+                show_captcha_window(img_data, img_len);
+            }
+            log_line("短信验证码自动识别失败，切换手工输入模式");
+            int manual_fail = 0;
+            while (manual_fail < 3) {
+                captcha[0] = 0;
+                if (!read_manual_captcha(captcha, sizeof(captcha))) {
+                    log_line("手工输入为空");
+                    manual_fail++;
+                    continue;
+                }
+                close_captcha_window();
+
+                char url[512];
+                snprintf(url, sizeof(url),
+                         "https://desk.ctyun.cn:8810/api/cdserv/client/device/getSmsCode?mobilePhone=%s&captchaCode=%s",
+                         phone, captcha);
+
+                char resp[MAX_RESP];
+                int rlen = api_get(s, url, resp, sizeof(resp));
+                if (rlen < 0) {
+                    log_line("发送短信验证码请求失败 (手工, 尝试%d)", manual_fail + 1);
+                    manual_fail++;
+                    continue;
+                }
+                int code = jint(resp, "code");
+                if (code == 0) {
+                    log_line("短信验证码已发送至 %s", phone);
+                    if (img_data) free(img_data);
+                    return 1;
+                }
+                char msg[256];
+                jstr(resp, "msg", msg, sizeof(msg));
+                log_line("发送短信验证码错误 (手工, 尝试%d): %s", manual_fail + 1, msg);
+                manual_fail++;
+            }
+            close_captcha_window();
+            if (img_data) free(img_data);
+            log_line("验证码识别错误");
+            InterlockedExchange(&g_running, 0);
+            return 0;
+        }
+
+        if (img_data) { free(img_data); img_data = NULL; }
+
+        char url[512];
+        snprintf(url, sizeof(url),
+                 "https://desk.ctyun.cn:8810/api/cdserv/client/device/getSmsCode?mobilePhone=%s&captchaCode=%s",
+                 phone, captcha);
+
+        char resp[MAX_RESP];
+        int rlen = api_get(s, url, resp, sizeof(resp));
+        if (rlen < 0) {
+            log_line("发送短信验证码请求失败 (尝试%d)", i + 1);
+            continue;
+        }
+        int code = jint(resp, "code");
+        if (code == 0) {
+            log_line("短信验证码已发送至 %s", phone);
+            return 1;
+        }
+        char msg[256];
+        jstr(resp, "msg", msg, sizeof(msg));
+        log_line("发送短信验证码错误 (尝试%d): %s", i + 1, msg);
+    }
+    return 0;
+}
+
+static int binding_device(const Session *s, const char *verification_code) {
+    char url[1024];
+    snprintf(url, sizeof(url),
+             "https://desk.ctyun.cn:8810/api/cdserv/client/device/binding?"
+             "verificationCode=%s&deviceName=Chrome%%E6%%B5%%8F%%E8%%A7%%88%%E5%%99%%A8"
+             "&deviceCode=%s&deviceModel=Windows+NT+10.0%%3B+Win64%%3B+x64"
+             "&sysVersion=Windows+NT+10.0%%3B+Win64%%3B+x64&appVersion=3.2.0"
+             "&hostName=pc.ctyun.cn&deviceInfo=Win32",
+             verification_code, s->device_code);
+
+    char resp[MAX_RESP];
+    int rlen = api_post(s, url, "", 0, "application/json", resp, sizeof(resp));
+    if (rlen < 0) {
+        log_line("设备绑定请求失败");
+        return 0;
+    }
+    int code = jint(resp, "code");
+    if (code == 0) {
+        log_line("设备绑定成功");
+        return 1;
+    }
+    char msg[256];
+    jstr(resp, "msg", msg, sizeof(msg));
+    log_line("设备绑定错误: %s", msg);
+    return 0;
+}
+
+static int do_device_binding(Session *s) {
+    if (s->bonded_device) return 1;
+
+    const char *phone = s->phone_number;
+    if (!phone[0]) {
+        log_line("无手机号，无法发送短信验证码");
+        return 0;
+    }
+
+    log_line("设备未绑定，正在发送短信验证码至 %s", phone);
+    if (!send_sms_code(s, phone)) {
+        log_line("发送短信验证码失败");
+        return 0;
+    }
+
+    char vcode[32];
+    printf("短信验证码: "); fflush(stdout);
+    fgets(vcode, sizeof(vcode), stdin);
+    vcode[strcspn(vcode, "\r\n")] = 0;
+
+    if (!vcode[0]) {
+        log_line("验证码为空");
+        return 0;
+    }
+
+    if (!binding_device(s, vcode)) {
+        log_line("设备绑定失败");
+        return 0;
+    }
+
+    s->bonded_device = 1;
+    return 1;
 }
 
 /* ======================== 桌面列表解析 ======================== */
@@ -1126,14 +1629,14 @@ static int get_desktop_list(Session *s, Desktop *desktops, int max) {
     char body[] = "{\"getCnt\":20,\"desktopTypes\":[\"1\",\"2001\",\"2002\",\"2003\"],\"sortType\":\"createTimeV1\"}";
     if (api_post(s, "https://desk.ctyun.cn:8810/api/desktop/client/pageDesktop",
                  body, strlen(body), "application/json", resp, sizeof(resp)) < 0) {
-        log_line("pageDesktop request failed");
+        log_line("获取桌面列表请求失败");
         return 0;
     }
     if (jint(resp, "code") != 0) {
-        log_line("pageDesktop code=%d", jint(resp, "code"));
+        log_line("获取桌面列表错误: code=%d", jint(resp, "code"));
         return 0;
     }
-    log_line("pageDesktop ok, parsing desktops");
+    log_line("获取桌面列表成功，正在解析桌面信息");
 
     /* 定位desktopList数组 */
     const char *dl = strstr(resp, "\"desktopList\"");
@@ -1167,7 +1670,7 @@ static int get_desktop_list(Session *s, Desktop *desktops, int max) {
         char status[64];
         jstr(block, "useStatusText", status, sizeof(status));
         desktops[count].is_active = (strcmp(status, "\xe8\xbf\x90\xe8\xa1\x8c\xe4\xb8\xad") == 0);
-        log_line("desktop[%d]: id=%s code=%s status=%s active=%d",
+        log_line("桌面[%d]: id=%s code=%s 状态=%s 运行中=%d",
                  count, desktops[count].desktop_id, desktops[count].desktop_code,
                  status, desktops[count].is_active);
         count++;
@@ -1194,11 +1697,11 @@ static int get_desktop_list_light(Session *s, DesktopLight *desktops, int max) {
     char body[] = "{\"getCnt\":20,\"desktopTypes\":[\"1\",\"2001\",\"2002\",\"2003\"],\"sortType\":\"createTimeV1\"}";
     if (api_post(s, "https://desk.ctyun.cn:8810/api/desktop/client/pageDesktop",
                  body, strlen(body), "application/json", resp, sizeof(resp)) < 0) {
-        log_line("pageDesktop request failed");
+        log_line("获取桌面列表请求失败");
         return 0;
     }
     if (jint(resp, "code") != 0) {
-        log_line("pageDesktop code=%d", jint(resp, "code"));
+        log_line("获取桌面列表错误: code=%d", jint(resp, "code"));
         return 0;
     }
     const char *dl = strstr(resp, "\"desktopList\"");
@@ -1262,13 +1765,13 @@ static int connect_desktop(Session *s, Desktop *d) {
     if (api_post(s, "https://desk.ctyun.cn:8810/api/desktop/client/connect",
                  post, strlen(post), "application/x-www-form-urlencoded",
                  resp, sizeof(resp)) < 0) {
-        log_line("connect request failed for %s", d->desktop_id);
+        log_line("连接桌面请求失败: %s", d->desktop_id);
         return 0;
     }
     if (jint(resp, "code") != 0) {
         char msg[256];
         jstr(resp, "msg", msg, sizeof(msg));
-        log_line("Connect Error: [%s] %s", d->desktop_id, msg);
+        log_line("连接桌面错误 [%s]: %s", d->desktop_id, msg);
         return 0;
     }
 
@@ -1304,7 +1807,7 @@ static int connect_desktop(Session *s, Desktop *d) {
     d->token = str_dup(tmp);
     jstr(block, "tenantMemberAccount", tmp, len + 1);
     d->tenant_account = str_dup(tmp);
-    log_line("connect ok: host=%s port=%s clink=%s",
+    log_line("连接桌面成功: host=%s port=%s clink=%s",
              d->host ? d->host : "", d->port ? d->port : "", d->clink_host ? d->clink_host : "");
     free(tmp);
     free(block);
@@ -1736,11 +2239,9 @@ static void get_fingerprint(char *fp_hex) {
             UUID u;
             RPC_STATUS rs = pUuidCreateSeq(&u);
             if (rs == 0 || rs == RPC_S_UUID_LOCAL_ONLY) {
-                /* UUID的Data4[2..7]包含MAC地址 */
                 snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
                          u.Data4[2], u.Data4[3], u.Data4[4],
                          u.Data4[5], u.Data4[6], u.Data4[7]);
-                log_line("UuidCreateSequential MAC: %s", mac);
             }
         }
         FreeLibrary(hRpc);
@@ -1765,7 +2266,6 @@ static void get_fingerprint(char *fp_hex) {
                     snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
                              adapter->Address[0], adapter->Address[1], adapter->Address[2],
                              adapter->Address[3], adapter->Address[4], adapter->Address[5]);
-                    log_line("GetAdaptersInfo MAC: %s", mac);
                     break;
                 }
             }
@@ -1780,6 +2280,14 @@ static void get_fingerprint(char *fp_hex) {
         free(buf);
     }
     mac_to_fingerprint(mac, fp_hex);
+}
+
+static void generate_device_code(const char *fp_hex, char *out, size_t out_sz) {
+    uint8_t h[32];
+    sha256((const uint8_t *)fp_hex, strlen(fp_hex), h);
+    snprintf(out, out_sz, "web_%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+             h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
+             h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]);
 }
 
 /**
@@ -1873,16 +2381,13 @@ static void derive_key(const char *fp, const char *salt, uint8_t key[32]) {
  * @return         1=解密并登录成功, 0=失败
  */
 static int try_decrypt_config(Session *s, const char *content, const char *fp) {
-    /* 提取盐值 */
     char salt[65];
     jstr(content, "salt", salt, sizeof(salt));
     if (!salt[0]) return 0;
 
-    /* 派生密钥 */
     uint8_t key[32];
     derive_key(fp, salt, key);
 
-    /* 定位accounts数组中的第一个对象 */
     const char *acc = strstr(content, "\"accounts\"");
     if (!acc) return 0;
     acc = strchr(acc, '[');
@@ -1890,13 +2395,11 @@ static int try_decrypt_config(Session *s, const char *content, const char *fp) {
     const char *obj = strchr(acc, '{');
     if (!obj) return 0;
 
-    /* 提取加密的用户名、密码、设备码 */
     char ua[2048], pw[2048], dc[2048];
     jstr(obj, "user_account", ua, sizeof(ua));
     jstr(obj, "password", pw, sizeof(pw));
     jstr(obj, "device_code", dc, sizeof(dc));
 
-    /* 尝试解密 */
     char user[256], pass[256], devc[256];
     int du = decrypt_data(ua, key, user);
     int dp = decrypt_data(pw, key, pass);
@@ -1904,11 +2407,11 @@ static int try_decrypt_config(Session *s, const char *content, const char *fp) {
 
     if (du && dp && dd) {
         strcpy(s->device_code, devc);
-        log_line("device_code: %s", s->device_code);
-        log_line("user from config: %s", user);
-        /* 用解密出的凭据自动登录 */
+        strncpy(s->phone_number, user, sizeof(s->phone_number) - 1);
+        s->phone_number[sizeof(s->phone_number) - 1] = '\0';
         if (do_login(s, user, pass)) return 1;
-        log_line("auto login failed, try manual");
+        log_line("自动登录失败，尝试手动输入");
+        return 2;
     }
     return 0;
 }
@@ -1927,21 +2430,18 @@ static int try_decrypt_config(Session *s, const char *content, const char *fp) {
  * @return   1=成功, 0=失败
  */
 static int resolve_credentials(Session *s) {
-    /* 构建config.json路径(与exe同目录) */
     char exe_path[MAX_PATH];
     GetModuleFileNameA(NULL, exe_path, MAX_PATH);
     char *slash = strrchr(exe_path, '\\');
     if (slash) *slash = 0;
     char config_path[MAX_PATH];
     snprintf(config_path, sizeof(config_path), "%s\\config.json", exe_path);
-    log_line("config path: %s", config_path);
+    log_line("配置文件路径: %s", config_path);
 
-    /* 获取本机指纹 */
     char fp[65];
     get_fingerprint(fp);
-    log_line("fingerprint: %s", fp);
+    log_line("机器指纹: %s", fp);
 
-    /* 尝试从config.json读取并解密 */
     FILE *f = fopen(config_path, "rb");
     if (f) {
         fseek(f, 0, SEEK_END);
@@ -1952,53 +2452,79 @@ static int resolve_credentials(Session *s) {
         content[clen] = 0;
         fclose(f);
 
-        /* 用主指纹尝试解密 */
-        if (try_decrypt_config(s, content, fp)) {
+        int dec_result = try_decrypt_config(s, content, fp);
+        if (dec_result == 1) {
             free(content);
+            if (!s->bonded_device && !do_device_binding(s)) {
+                log_line("需要设备绑定但绑定失败");
+                return 0;
+            }
             return 1;
         }
-
-        /* 主指纹失败，遍历所有MAC地址尝试 */
-        log_line("primary fingerprint failed, trying all MACs...");
-        char macs[32][32];
-        int nmacs = get_all_macs(macs, 32);
-        for (int i = 0; i < nmacs; i++) {
-            char alt_fp[65];
-            mac_to_fingerprint(macs[i], alt_fp);
-            if (strcmp(alt_fp, fp) == 0) continue;  /* 跳过已尝试的主指纹 */
-            log_line("trying MAC: %s fp: %s", macs[i], alt_fp);
-            if (try_decrypt_config(s, content, alt_fp)) {
-                free(content);
-                return 1;
+        if (dec_result == 2) {
+            free(content);
+            log_line("配置解密成功但登录失败，尝试手动输入");
+        } else {
+            log_line("主指纹解密失败，尝试所有MAC地址...");
+            char macs[32][32];
+            int nmacs = get_all_macs(macs, 32);
+            int found_decrypt = 0;
+            for (int i = 0; i < nmacs; i++) {
+                char alt_fp[65];
+                mac_to_fingerprint(macs[i], alt_fp);
+                if (strcmp(alt_fp, fp) == 0) continue;
+                int r = try_decrypt_config(s, content, alt_fp);
+                if (r == 1) {
+                    free(content);
+                    if (!s->bonded_device && !do_device_binding(s)) {
+                        log_line("需要设备绑定但绑定失败");
+                        return 0;
+                    }
+                    return 1;
+                }
+                if (r == 2) {
+                    found_decrypt = 1;
+                    break;
+                }
+            }
+            free(content);
+            if (found_decrypt) {
+                log_line("配置解密成功但登录失败，尝试手动输入");
+            } else {
+                log_line("所有MAC地址均无法解密配置，尝试手动输入");
             }
         }
-
-        free(content);
-        log_line("config.json decode failed with all MACs, manual input");
     } else {
-        log_line("config.json not found at %s", config_path);
+        log_line("配置文件不存在: %s", config_path);
     }
 
-    /* 自动解密失败，手动输入账号密码 */
     char user[128], pass[128];
-    printf("\xe8\xb4\xa6\xe6\x88\xb7: "); fflush(stdout);
+    printf("账户: "); fflush(stdout);
     fgets(user, sizeof(user), stdin); user[strcspn(user, "\r\n")] = 0;
-    printf("\xe5\xaf\x86\xe7\xa0\x81: "); fflush(stdout);
+    printf("密码: "); fflush(stdout);
     fgets(pass, sizeof(pass), stdin); pass[strcspn(pass, "\r\n")] = 0;
 
-    if (!user[0] || !pass[0]) { log_line("\xe8\xb4\xa6\xe6\x88\xb7\xe6\x88\x96\xe5\xaf\x86\xe7\xa0\x81\xe4\xb8\xba\xe7\xa9\xba"); return 0; }
+    if (!user[0] || !pass[0]) { log_line("账户或密码为空"); return 0; }
 
-    /* 生成随机设备码(格式: web_ + 32位十六进制) */
-    BYTE rnd[16];
-    CryptGenRandom(g_crypt, 16, rnd);
-    char dc_hex[33];
-    for (int i = 0; i < 16; i++) sprintf(dc_hex + i * 2, "%02x", rnd[i]);
-    snprintf(s->device_code, sizeof(s->device_code), "web_%s", dc_hex);
+    if (g_random) {
+        BYTE rnd[16];
+        CryptGenRandom(g_crypt, 16, rnd);
+        char dc_hex[33];
+        for (int i = 0; i < 16; i++) sprintf(dc_hex + i * 2, "%02x", rnd[i]);
+        snprintf(s->device_code, sizeof(s->device_code), "web_%s", dc_hex);
+    } else {
+        generate_device_code(fp, s->device_code, sizeof(s->device_code));
+    }
 
-    /* 执行登录 */
+    strncpy(s->phone_number, user, sizeof(s->phone_number) - 1);
+    s->phone_number[sizeof(s->phone_number) - 1] = '\0';
     if (!do_login(s, user, pass)) return 0;
 
-    /* 登录成功，加密保存凭据到config.json(隐私模式下跳过) */
+    if (!s->bonded_device && !do_device_binding(s)) {
+        log_line("需要设备绑定但绑定失败");
+        return 0;
+    }
+
     if (!g_privacy) {
         char salt[33];
         BYTE salt_bytes[16];
@@ -2019,10 +2545,10 @@ static int resolve_credentials(Session *s) {
             fprintf(f, "{\"salt\":\"%s\",\"accounts\":[{\"user_account\":\"%s\",\"password\":\"%s\",\"device_code\":\"%s\"}]}",
                     salt, enc_user, enc_pass, enc_dc);
             fclose(f);
-            log_line("config saved to %s", config_path);
+            log_line("配置已保存至 %s", config_path);
         }
     } else {
-        log_line("\xe9\x9a\x90\xe7\xa7\x81\xe6\xa8\xa1\xe5\xbc\x8f\xe5\xb7\xb2\xe5\x90\xaf\xe7\x94\xa8\xef\xbc\x8c\xe4\xb8\x8d\xe4\xbf\x9d\xe5\xad\x98\xe5\x87\xad\xe6\x8d\xae");
+        log_line("隐私模式已启用，不保存凭据");
     }
 
     return 1;
@@ -2075,7 +2601,7 @@ static size_t rsa_oaep_encrypt(const uint8_t *n_bytes, size_t n_len, uint32_t e_
                                            &hKey, blob, blob_len, 0);
     free(blob);
     if (!BCRYPT_SUCCESS(status)) {
-        log_line("BCryptImportKeyPair failed: 0x%08X", status);
+        log_line("RSA公钥导入失败: 0x%08X", status);
         return 0;
     }
 
@@ -2092,7 +2618,7 @@ static size_t rsa_oaep_encrypt(const uint8_t *n_bytes, size_t n_len, uint32_t e_
     BCryptDestroyKey(hKey);
 
     if (!BCRYPT_SUCCESS(status)) {
-        log_line("BCryptEncrypt failed: 0x%08X", status);
+        log_line("RSA加密失败: 0x%08X", status);
         return 0;
     }
 
@@ -2206,8 +2732,10 @@ static int ws_connect(const char *uri, WSConn *wsc) {
         if (hlen >= (int)sizeof(host)) hlen = (int)sizeof(host) - 1;
         memcpy(host, hp, hlen); host[hlen] = 0;
         strncpy(path, sl, sizeof(path) - 1);
+        path[sizeof(path) - 1] = '\0';
     } else {
         strncpy(host, hp, sizeof(host) - 1);
+        host[sizeof(host) - 1] = '\0';
     }
 
     /* 从主机名中提取端口 */
@@ -2219,7 +2747,7 @@ static int ws_connect(const char *uri, WSConn *wsc) {
     wsc->hSession = WinHttpOpen(L"CtYunKeepAlive/1.1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!wsc->hSession) {
-        log_line("WinHttpOpen failed: %lu", GetLastError());
+        log_line("HTTP会话创建失败: %lu", GetLastError());
         return 0;
     }
 
@@ -2228,7 +2756,7 @@ static int ws_connect(const char *uri, WSConn *wsc) {
     MultiByteToWideChar(CP_ACP, 0, host, -1, whost, 256);
     wsc->hConnect = WinHttpConnect(wsc->hSession, whost, (INTERNET_PORT)port, 0);
     if (!wsc->hConnect) {
-        log_line("WinHttpConnect failed: %lu", GetLastError());
+        log_line("HTTP连接失败: %lu", GetLastError());
         WinHttpCloseHandle(wsc->hSession);
         return 0;
     }
@@ -2240,7 +2768,7 @@ static int ws_connect(const char *uri, WSConn *wsc) {
     wsc->hRequest = WinHttpOpenRequest(wsc->hConnect, L"GET", wpath, NULL,
                                         WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
     if (!wsc->hRequest) {
-        log_line("WinHttpOpenRequest failed: %lu", GetLastError());
+        log_line("HTTP请求创建失败: %lu", GetLastError());
         WinHttpCloseHandle(wsc->hConnect);
         WinHttpCloseHandle(wsc->hSession);
         return 0;
@@ -2261,7 +2789,7 @@ static int ws_connect(const char *uri, WSConn *wsc) {
 
     /* 设置WebSocket升级选项 */
     if (!WinHttpSetOption(wsc->hRequest, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0)) {
-        log_line("WinHttpSetOption(UPGRADE_TO_WEB_SOCKET) failed: %lu", GetLastError());
+        log_line("WebSocket升级选项设置失败: %lu", GetLastError());
         WinHttpCloseHandle(wsc->hRequest);
         WinHttpCloseHandle(wsc->hConnect);
         WinHttpCloseHandle(wsc->hSession);
@@ -2271,7 +2799,7 @@ static int ws_connect(const char *uri, WSConn *wsc) {
     /* 发送HTTP升级请求 */
     if (!WinHttpSendRequest(wsc->hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                              WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
-        log_line("WinHttpSendRequest failed: %lu", GetLastError());
+        log_line("HTTP请求发送失败: %lu", GetLastError());
         WinHttpCloseHandle(wsc->hRequest);
         WinHttpCloseHandle(wsc->hConnect);
         WinHttpCloseHandle(wsc->hSession);
@@ -2280,7 +2808,7 @@ static int ws_connect(const char *uri, WSConn *wsc) {
 
     /* 接收服务端响应 */
     if (!WinHttpReceiveResponse(wsc->hRequest, NULL)) {
-        log_line("WinHttpReceiveResponse failed: %lu", GetLastError());
+        log_line("HTTP响应接收失败: %lu", GetLastError());
         WinHttpCloseHandle(wsc->hRequest);
         WinHttpCloseHandle(wsc->hConnect);
         WinHttpCloseHandle(wsc->hSession);
@@ -2293,7 +2821,7 @@ static int ws_connect(const char *uri, WSConn *wsc) {
     WinHttpQueryHeaders(wsc->hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                         NULL, &status_code, &sc_len, NULL);
     if (status_code != 101) {
-        log_line("WS upgrade failed, status=%lu", status_code);
+        log_line("WebSocket升级失败，状态码=%lu", status_code);
         WinHttpCloseHandle(wsc->hRequest);
         WinHttpCloseHandle(wsc->hConnect);
         WinHttpCloseHandle(wsc->hSession);
@@ -2303,7 +2831,7 @@ static int ws_connect(const char *uri, WSConn *wsc) {
     /* 完成WebSocket升级 */
     wsc->hWebSocket = WinHttpWebSocketCompleteUpgrade(wsc->hRequest, (DWORD_PTR)NULL);
     if (!wsc->hWebSocket) {
-        log_line("WinHttpWebSocketCompleteUpgrade failed: %lu", GetLastError());
+        log_line("WebSocket升级完成失败: %lu", GetLastError());
         WinHttpCloseHandle(wsc->hRequest);
         WinHttpCloseHandle(wsc->hConnect);
         WinHttpCloseHandle(wsc->hSession);
@@ -2314,7 +2842,7 @@ static int ws_connect(const char *uri, WSConn *wsc) {
     WinHttpCloseHandle(wsc->hRequest);
     wsc->hRequest = NULL;
 
-    log_line("WS handshake ok");
+    log_line("WebSocket握手成功");
     return 1;
 }
 
@@ -2414,11 +2942,11 @@ static DWORD WINAPI keep_alive_thread(LPVOID param) {
 
     int cycle = 0;
     while (g_running) {
-        log_line("[%s] === connecting ===", d->desktop_code);
+        log_line("[%s] 正在连接...", d->desktop_code);
         WSConn wsc;
         /* 使用预构建的ws_uri连接(保活阶段host/port已释放) */
         if (!ws_connect(d->ws_uri, &wsc)) {
-            log_line("[%s] WS connect failed, retry 5s", d->desktop_code);
+            log_line("[%s] WebSocket连接失败，5秒后重试", d->desktop_code);
             Sleep(5000);
             continue;
         }
@@ -2429,7 +2957,7 @@ static DWORD WINAPI keep_alive_thread(LPVOID param) {
         /* 发送初始REDQ协议载荷 */
         ws_send_bytes(&wsc, initial_payload, sizeof(initial_payload));
 
-        log_line("[%s] connected, keep 60s", d->desktop_code);
+        log_line("[%s] 已连接，保持60秒", d->desktop_code);
 
         /* 维持连接60秒，处理REDQ认证请求 */
         DWORD start = GetTickCount();
@@ -2441,25 +2969,25 @@ static DWORD WINAPI keep_alive_thread(LPVOID param) {
             if (n == 0) continue; /* 无数据 */
             /* 处理REDQ认证请求 */
             if (!is_text && n >= 4 && memcmp(buf, "REDQ", 4) == 0) {
-                log_line("[%s] -> REDQ recv", d->desktop_code);
+                log_line("[%s] 收到REDQ认证请求", d->desktop_code);
                 uint8_t resp[512]; size_t rlen = 0;
                 if (handle_redq(buf, n, resp, &rlen)) {
                     ws_send_bytes(&wsc, resp, rlen);
-                    log_line("[%s] -> REDQ resp ok", d->desktop_code);
+                    log_line("[%s] REDQ认证响应成功", d->desktop_code);
                 }
             }
         }
 
         /* 60秒到，断开重连 */
         ws_close(&wsc);
-        log_line("[%s] 60s done, reconnect", d->desktop_code);
+        log_line("[%s] 60秒完成，重新连接", d->desktop_code);
 
         /* 每5个周期(约5分钟)修剪工作集，释放物理内存 */
         cycle++;
         if (cycle % 5 == 0) trim_working_set();
     }
 
-    log_line("[%s] thread exit", d->desktop_code);
+    log_line("[%s] 线程退出", d->desktop_code);
     return 0;
 }
 
@@ -2484,7 +3012,7 @@ static DWORD WINAPI check_desktop_thread(LPVOID param) {
     while (g_running) {
         Sleep(CHECK_INTERVAL * 1000);
         if (!g_running) break;
-        log_line("[%s] checking status...", d->desktop_code);
+        log_line("[%s] 正在检查状态...", d->desktop_code);
 
         /* 使用轻量结构体查询桌面状态 */
         DesktopLight *tmp = (DesktopLight *)calloc(MAX_DESKTOPS, sizeof(DesktopLight));
@@ -2495,7 +3023,7 @@ static DWORD WINAPI check_desktop_thread(LPVOID param) {
                 found = 1;
                 if (tmp[i].is_active) {
                     /* 桌面已开机，切换为保活模式 */
-                    log_line("[%s] active now, start keepalive", d->desktop_code);
+                    log_line("[%s] 桌面已激活，开始保活", d->desktop_code);
                     free(tmp);
                     if (connect_desktop(s, d)) {
                         desktop_free_certs(d);
@@ -2503,13 +3031,13 @@ static DWORD WINAPI check_desktop_thread(LPVOID param) {
                     }
                     return 0;
                 } else {
-                    log_line("[%s] still inactive", d->desktop_code);
+                    log_line("[%s] 桌面仍未激活", d->desktop_code);
                 }
                 break;
             }
         }
         free(tmp);
-        if (!found) { log_line("[%s] not found, stop", d->desktop_code); return 0; }
+        if (!found) { log_line("[%s] 桌面未找到，停止监控", d->desktop_code); return 0; }
         trim_working_set();
     }
     return 0;
@@ -2536,12 +3064,13 @@ static BOOL WINAPI ctrl_handler(DWORD type) {
 static void usage(const char *exe) {
     printf("天翼云电脑保活客户端 v1.1.0\n");
     printf("项目地址: https://github.com/DionZM/ctyun_keepalive_c\n\n");
-    printf("用法: %s [OPTIONS]\n\n", exe);
-    printf("OPTIONS:\n");
-    printf("  --background, -b  后台运行，日志写入run.log\n");
-    printf("  --privacy,    -p  隐私模式，不保存用户名/密码到config.json\n");
-    printf("  --version,    -v  显示版本号\n");
-    printf("  --help,       -h  显示此帮助信息\n");
+    printf("用法: %s [选项]\n\n", exe);
+    printf("选项:\n");
+    printf("  /background, /b  后台运行，日志写入run.log\n");
+    printf("  /privacy,    /p  隐私模式，不保存用户名/密码到config.json\n");
+    printf("  /random,     /r  随机生成设备码(默认基于机器指纹确定性生成)\n");
+    printf("  /version,    /v  显示版本号\n");
+    printf("  /help,       /h  显示此帮助信息\n");
 }
 
 /**
@@ -2561,14 +3090,16 @@ static void usage(const char *exe) {
  */
 int main(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--background") == 0 || strcmp(argv[i], "-b") == 0) {
+        if (strcmp(argv[i], "/background") == 0 || strcmp(argv[i], "/b") == 0) {
             g_background = 1;
-        } else if (strcmp(argv[i], "--privacy") == 0 || strcmp(argv[i], "-p") == 0) {
+        } else if (strcmp(argv[i], "/privacy") == 0 || strcmp(argv[i], "/p") == 0) {
             g_privacy = 1;
-        } else if (strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-v") == 0) {
-            printf("v1.1.0\n");
+        } else if (strcmp(argv[i], "/random") == 0 || strcmp(argv[i], "/r") == 0) {
+            g_random = 1;
+        } else if (strcmp(argv[i], "/version") == 0 || strcmp(argv[i], "/v") == 0) {
+            printf("版本 1.1.0\n");
             return 0;
-        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+        } else if (strcmp(argv[i], "/help") == 0 || strcmp(argv[i], "/h") == 0 || strcmp(argv[i], "/?") == 0) {
             usage(argv[0]);
             return 0;
         }
@@ -2596,24 +3127,24 @@ int main(int argc, char *argv[]) {
     crypto_init();
     http_init();
 
-    log_line("\xe5\xa4\xa9\xe7\xbf\xbc\xe4\xba\x91\xe7\x94\xb5\xe8\x84\x91\xe4\xbf\x9d\xe6\xb4\xbb C 1.1.0");
+    log_line("天翼云电脑保活 C 1.1.0");
 
     /* 解析用户凭据(尝试自动解密config.json，失败则手动输入) */
     Session session = {0};
     if (!resolve_credentials(&session)) {
-        log_line("\xe5\x87\xad\xe6\x8d\xae\xe8\xa7\xa3\xe6\x9e\x90\xe5\xa4\xb1\xe8\xb4\xa5");
+        log_line("凭据解析失败");
         WSACleanup();
         return 1;
     }
 
     /* 登录成功后清零用户名(不再需要，节省内存) */
-    log_line("\xe7\x99\xbb\xe5\xbd\x95\xe6\x88\x90\xe5\x8a\x9f, \xe7\x94\xa8\xe6\x88\xb7: %s", session.user_name);
+    log_line("登录成功, 用户: %s", session.user_name);
     memset(session.user_name, 0, sizeof(session.user_name));
 
     /* 获取桌面列表 */
     Desktop *desktops = (Desktop *)calloc(MAX_DESKTOPS, sizeof(Desktop));
     int ndesktops = get_desktop_list(&session, desktops, MAX_DESKTOPS);
-    log_line("\xe6\x89\xbe\xe5\x88\xb0 %d \xe4\xb8\xaa\xe6\xa1\x8c\xe9\x9d\xa2", ndesktops);
+    log_line("找到 %d 个桌面", ndesktops);
 
     /* 为每个桌面创建工作线程 */
     ThreadParam params[MAX_DESKTOPS];
@@ -2627,17 +3158,17 @@ int main(int argc, char *argv[]) {
         if (desktops[i].is_active) {
             if (connect_desktop(&session, &desktops[i])) {
                 desktop_free_certs(&desktops[i]);
-                log_line("[%s] \xe8\xbf\x90\xe8\xa1\x8c\xe4\xb8\xad, \xe5\xbc\x80\xe5\xa7\x8b\xe4\xbf\x9d\xe6\xb4\xbb", desktops[i].desktop_code);
+                log_line("[%s] 运行中, 开始保活", desktops[i].desktop_code);
                 threads[nthreads++] = CreateThread(NULL, THREAD_STACK, keep_alive_thread, &params[i], 0, NULL);
             }
         } else {
-            log_line("[%s] \xe5\xb7\xb2\xe5\x85\xb3\xe6\x9c\xba, \xe5\xbc\x80\xe5\xa7\x8b\xe7\x9b\x91\xe6\x8e\xa7", desktops[i].desktop_code);
+            log_line("[%s] 已关机, 开始监控", desktops[i].desktop_code);
             threads[nthreads++] = CreateThread(NULL, THREAD_STACK, check_desktop_thread, &params[i], 0, NULL);
         }
     }
 
     if (nthreads == 0) {
-        log_line("\xe6\xb2\xa1\xe6\x9c\x89\xe5\x8f\xaf\xe7\x94\xa8\xe6\xa1\x8c\xe9\x9d\xa2");
+        log_line("没有可用桌面");
     } else {
         HANDLE hInputThread = NULL;
 
@@ -2652,13 +3183,13 @@ int main(int argc, char *argv[]) {
                 g_log_file = fopen(g_log_path, "a");
             }
             FreeConsole();
-            log_line("\xe5\xb7\xb2\xe5\x88\x87\xe6\x8d\xa2\xe5\x88\xb0\xe5\x90\x8e\xe5\x8f\xb0\xe8\xbf\x90\xe8\xa1\x8c, \xe6\x97\xa5\xe5\xbf\x97: %s", g_log_path);
+            log_line("已切换到后台运行, 日志: %s", g_log_path);
         } else {
             hInputThread = CreateThread(NULL, THREAD_STACK, console_input_thread, NULL, 0, NULL);
         }
 
         trim_working_set();
-        log_line("\xe4\xbf\x9d\xe6\xb4\xbb\xe5\xb7\xb2\xe5\x90\xaf\xe5\x8a\xa8, Ctrl+C \xe5\x81\x9c\xe6\xad\xa2");
+        log_line("保活已启动, Ctrl+C 停止");
 
         while (g_running) {
             DWORD result = WaitForMultipleObjects(nthreads, threads, TRUE, 500);
@@ -2673,7 +3204,7 @@ int main(int argc, char *argv[]) {
                 if (!g_log_file) g_log_file = fopen(g_log_path, "a");
                 g_background = 1;
                 FreeConsole();
-                log_line("\xe5\xb7\xb2\xe5\x88\x87\xe6\x8d\xa2\xe5\x88\xb0\xe5\x90\x8e\xe5\x8f\xb0\xe8\xbf\x90\xe8\xa1\x8c, \xe6\x97\xa5\xe5\xbf\x97: %s", g_log_path);
+                log_line("已切换到后台运行, 日志: %s", g_log_path);
                 if (hInputThread) {
                     WaitForSingleObject(hInputThread, 2000);
                     CloseHandle(hInputThread);
@@ -2702,6 +3233,6 @@ int main(int argc, char *argv[]) {
     if (g_rsa_alg) BCryptCloseAlgorithmProvider(g_rsa_alg, 0);
     CryptReleaseContext(g_crypt, 0);
     WSACleanup();
-    log_line("\xe5\xb7\xb2\xe5\x81\x9c\xe6\xad\xa2");
+    log_line("已停止");
     return 0;
 }

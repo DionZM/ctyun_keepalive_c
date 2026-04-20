@@ -6,6 +6,7 @@
 *.pdb
 *.ilk
 *.exp
+bin/
 
 # Runtime files
 run.log
