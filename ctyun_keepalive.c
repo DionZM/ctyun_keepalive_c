@@ -2848,19 +2848,14 @@ static void derive_key(const char *fp, const char *salt, uint8_t key[32]) {
 /**
  * protect_data_dpapi - 使用Windows DPAPI加密数据
  *
- * DPAPI优势:
- * 1. 密钥由Windows自动管理，绑定当前用户账户
- * 2. 使用用户登录密码作为根密钥
- * 3. 支持可选的额外熵（本机指纹）
- * 4. 无需自己管理密钥派生
- * 5. 符合企业安全策略
- *
- * 注意: 不使用CRYPTPROTECT_LOCAL_MACHINE，确保绑定到当前用户
- *       同一台机器的其他用户无法解密
+ * 使用CRYPTPROTECT_LOCAL_MACHINE标志绑定到本机:
+ * - 确保重启后同一台机器的任何用户都能解密
+ * - 内层ChaCha20-Poly1305已提供硬件指纹绑定保护
+ * - entropy参数(本机指纹)作为额外安全层
  *
  * @param plaintext   明文数据
  * @param plain_len   明文长度
- * @param entropy     额外熵（可选，提高安全性）
+ * @param entropy     额外熵（本机指纹，提高安全性）
  * @param out         输出加密数据（需调用LocalFree释放）
  * @param out_len     输出长度
  * @return            1=成功, 0=失败
@@ -2877,7 +2872,7 @@ static int protect_data_dpapi(const uint8_t *plaintext, DWORD plain_len,
         entropy_blob.pbData = (BYTE *)entropy;
     }
 
-    DWORD flags = CRYPTPROTECT_UI_FORBIDDEN;
+    DWORD flags = CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN;
 
     BOOL result = CryptProtectData(
         &data_in,
@@ -2909,7 +2904,7 @@ static int unprotect_data_dpapi(const uint8_t *ciphertext, DWORD cipher_len,
         entropy_blob.pbData = (BYTE *)entropy;
     }
 
-    DWORD flags = CRYPTPROTECT_UI_FORBIDDEN;
+    DWORD flags = CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN;
 
     BOOL result = CryptUnprotectData(
         &data_in, NULL,
