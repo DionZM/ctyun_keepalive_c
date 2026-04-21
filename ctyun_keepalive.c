@@ -66,14 +66,15 @@
 #pragma comment(lib, "windowscodecs.lib") /* WIC: 图像解码 */
 #pragma comment(lib, "user32.lib")      /* 窗口管理: CreateWindowExW */
 #pragma comment(lib, "gdi32.lib")       /* GDI: CreateDIBSection, StretchBlt */
+#pragma comment(lib, "psapi.lib")       /* Process Status API: 内存信息 */
 
 /* ======================== 常量定义 ======================== */
-#define APP_VERSION   "1.2.3"
+#define APP_VERSION   "1.2.4"
 /*
- * 1.2.3 版本说明:
- * 1. 优化1: DesktopLight添加id_hash预计算，monitor线程直接使用，减少重复hash
- * 2. 优化2: do_login中密码哈希提前预计算，避免手工/自动两个分支重复计算
- * 3. 保留1.2.2的所有已有优化
+ * 1.2.4 版本说明:
+ * 1. 优化1: 智能trim_working_set调用，只在内存增长超过阈值时才trim
+ * 2. 优化2: WinHTTP连接超时设置，减少等待时间
+ * 3. 保留1.2.3的所有已有优化
  */
 #define MAX_DESKTOPS  10       /* 最大桌面数量 */
 #define CHECK_INTERVAL 180     /* 未运行桌面状态检查间隔(秒)，即3分钟 */
@@ -113,18 +114,59 @@ static int g_privacy = 0;
 
 static int g_random = 0;
 
+/* ================ 优化1.2.4新增: 内存跟踪和WinHTTP参数 ================ */
+/* 上次trim_working_set调用时的内存使用量(KB) */
+static SIZE_T g_last_trim_memory_kb = 0;
+/* 内存增长阈值(KB) - 超过此值才触发trim */
+#define TRIM_MEMORY_THRESHOLD_KB (2*1024)  /* 2MB */
+/* WinHTTP超时设置(毫秒) */
+#define WINHTTP_CONNECT_TIMEOUT_MS  15000  /* 连接超时15秒 */
+#define WINHTTP_SEND_TIMEOUT_MS     30000  /* 发送超时30秒 */
+#define WINHTTP_RECEIVE_TIMEOUT_MS  30000  /* 接收超时30秒 */
+/* =============================================================== */
+
 /* ======================== 工具函数 ======================== */
 
 /**
- * trim_working_set - 修剪进程工作集，将物理内存页归还OS
+ * trim_working_set - 智能修剪进程工作集，将物理内存页归还OS
  *
- * 调用SetProcessWorkingSetSize传入-1,-1，通知Windows尽可能将
- * 进程的未使用内存页换出物理内存。在保活循环中定期调用，
- * 可将进程的"工作集"(物理内存占用)降至最低。
- * 注意: 这不影响虚拟内存，仅影响物理内存驻留。
+ * 优化v1.2.4: 只有当内存增长超过阈值时才调用trim，避免不必要的系统调用
+ * 使用GetProcessMemoryInfo获取当前内存使用情况进行判断
+ *
+ * @param force 1=强制trim, 0=智能判断
  */
-static void trim_working_set(void) {
-    SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+static void trim_working_set(int force) {
+    PROCESS_MEMORY_COUNTERS pmc;
+    SIZE_T current_memory_kb = 0;
+    int should_trim = force;
+
+    /* 智能判断模式: 检查内存增长 */
+    if (!force) {
+        HANDLE hProcess = GetCurrentProcess();
+        if (GetProcessMemoryInfo(hProcess, &pmc, sizeof(pmc))) {
+            current_memory_kb = pmc.WorkingSetSize / 1024;
+            /* 如果是第一次或内存增长超过阈值 */
+            if (g_last_trim_memory_kb == 0) {
+                should_trim = 1;
+            } else if (current_memory_kb > g_last_trim_memory_kb + TRIM_MEMORY_THRESHOLD_KB) {
+                should_trim = 1;
+            }
+        }
+    }
+
+    if (should_trim) {
+        SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+        /* 更新上次trim时的内存使用量 */
+        if (!force) {
+            HANDLE hProcess = GetCurrentProcess();
+            if (GetProcessMemoryInfo(hProcess, &pmc, sizeof(pmc))) {
+                g_last_trim_memory_kb = pmc.WorkingSetSize / 1024;
+                log_line("内存智能trim: 从%lluKB降至%lluKB", 
+                        (unsigned long long)current_memory_kb, 
+                        (unsigned long long)g_last_trim_memory_kb);
+            }
+        }
+    }
 }
 
 static void refresh_banner(void) {
@@ -784,6 +826,7 @@ static void desktop_cleanup(Desktop *d) {
 /**
  * http_init - 初始化WinHTTP会话
  *
+ * 优化v1.2.4: 设置合理的超时参数，避免长时间等待
  * 创建全局WinHTTP会话句柄，模拟Chrome浏览器User-Agent。
  * 所有HTTP请求复用此会话，减少资源开销。
  *
@@ -792,7 +835,13 @@ static void desktop_cleanup(Desktop *d) {
 static int http_init(void) {
     g_inet = WinHttpOpen(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
                           WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    return g_inet ? 1 : 0;
+    if (!g_inet) return 0;
+
+    /* 优化v1.2.4: 设置WinHTTP超时参数 */
+    DWORD timeout_ms;
+    timeout_ms = WINHTTP_CONNECT_TIMEOUT_MS;
+    WinHttpSetTimeouts(g_inet, timeout_ms, WINHTTP_SEND_TIMEOUT_MS, WINHTTP_RECEIVE_TIMEOUT_MS, 0);
+    return 1;
 }
 
 /**
@@ -3499,9 +3548,9 @@ static DWORD WINAPI keep_alive_thread(LPVOID param) {
         ws_close(&wsc);
         log_line("[%s] 60秒完成，重新连接", d->desktop_code);
 
-        /* 每5个周期(约5分钟)修剪工作集，释放物理内存 */
+        /* 每5个周期(约5分钟)智能修剪工作集，释放物理内存 */
         cycle++;
-        if (cycle % 5 == 0) trim_working_set();
+        if (cycle % 5 == 0) trim_working_set(0);
     }
 
     log_line("[%s] 线程退出", d->desktop_code);
@@ -3592,8 +3641,8 @@ static DWORD WINAPI monitor_desktops_thread(LPVOID param) {
             }
         }
 
-        /* 轮询周期间隔较长，顺手将未使用的物理内存归还给系统 */
-        trim_working_set();
+        /* 轮询周期间隔较长，智能将未使用的物理内存归还给系统 */
+        trim_working_set(0);
     }
     return 0;
 }
@@ -3771,7 +3820,7 @@ int main(int argc, char *argv[]) {
             hInputThread = CreateThread(NULL, THREAD_STACK, console_input_thread, NULL, 0, NULL);
         }
 
-        trim_working_set();
+        trim_working_set(1);
         log_line("保活已启动, Ctrl+C 停止");
 
         while (g_running) {
