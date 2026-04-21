@@ -30,7 +30,7 @@
  *   相比1.2.1及之前版本，可提升5-10%运行性能，减小可执行文件体积
  *
  * 版本: 1.3.0
- */
+ ga/
 
 /* ======================== 标准库与系统头文件 ======================== */
 #include <stdio.h>
@@ -70,20 +70,14 @@
 #pragma comment(lib, "psapi.lib")       /* Process Status API: 内存信息 */
 
 /* ======================== 常量定义 ======================== */
-#define APP_VERSION   "1.3.0"
+#define APP_VERSION   "1.3.1"
 /*
- * 1.3.0 版本说明:
- * 1. 修复: hconn句柄泄漏，长时间运行不再累积泄漏
- * 2. 修复: 连接失败不再错误触发start_event，避免保活线程崩溃
- * 3. 修复: decrypt_data增加缓冲区大小参数，防止溢出
- * 4. 修复: WinHttpSetTimeouts参数顺序纠正
- * 5. 安全: 密钥派生升级为PBKDF2-HMAC-SHA256 (100,000次迭代)
- * 6. 安全: 新增Windows DPAPI分层加密，绑定用户账户+本机硬件双因素
- * 7. 优化: sha256_hex/md5_hex/url_encode使用查表法替代sprintf/strchr
- * 8. 优化: make_sig_headers时间戳只格式化一次
- * 9. 安全: 移除日志中的验证码明文输出
- * 10. 安全: md5_hex添加CryptCreateHash返回值检查
- * 11. 兼容: 自动识别v1.x和v2.0配置格式，无缝升级
+ * 1.3.1 版本说明:
+ * 1. 修复: 移除UuidCreateSequential，改用GetAdaptersInfo获取稳定MAC地址
+ *    - UuidCreateSequential在VPN/虚拟网卡环境下返回不稳定MAC，重启后变化
+ *    - 导致DPAPI解密失败，配置无法恢复
+ * 2. 修复: DPAPI恢复使用CRYPTPROTECT_LOCAL_MACHINE，确保重启后可解密
+ * 3. 保留1.3.0的所有其他修复
  */
 #define MAX_DESKTOPS  10       /* 最大桌面数量 */
 #define CHECK_INTERVAL 180     /* 未运行桌面状态检查间隔(秒)，即3分钟 */
@@ -2664,66 +2658,43 @@ static void mac_to_fingerprint(const char *mac, char *fp_hex) {
 /**
  * get_fingerprint - 获取本机指纹
  *
- * 优先使用UuidCreateSequential获取MAC地址(与Python版本一致)，
- * 失败时回退到GetAdaptersInfo枚举网卡。
- *
- * 两种方式获取的MAC可能不同:
- *   - UuidCreateSequential: 返回系统认为的"第一个"MAC
- *   - GetAdaptersInfo: 按适配器顺序枚举
+ * 使用GetAdaptersInfo获取第一个非零物理网卡MAC地址。
+ * 不再使用UuidCreateSequential，因为该函数在VPN/虚拟网卡环境下
+ * 返回的MAC地址不稳定，重启后可能变化，导致配置无法解密。
  *
  * @param fp_hex  输出64字符十六进制指纹
  */
 static void get_fingerprint(char *fp_hex) {
-    /* 方式1: 通过UuidCreateSequential获取MAC(推荐，与Python一致) */
-    HMODULE hRpc = LoadLibraryA("rpcrt4.dll");
     char mac[32] = "";
-    if (hRpc) {
-        FnUuidCreateSequential pUuidCreateSeq = (FnUuidCreateSequential)GetProcAddress(hRpc, "UuidCreateSequential");
-        if (pUuidCreateSeq) {
-            UUID u;
-            RPC_STATUS rs = pUuidCreateSeq(&u);
-            if (rs == 0 || rs == RPC_S_UUID_LOCAL_ONLY) {
+    DWORD sz = 0;
+    GetAdaptersInfo(NULL, &sz);
+    BYTE *buf = (BYTE *)malloc(sz);
+    PIP_ADAPTER_INFO pinfo = (PIP_ADAPTER_INFO)buf;
+    GetAdaptersInfo(pinfo, &sz);
+    PIP_ADAPTER_INFO adapter = pinfo;
+    while (adapter) {
+        if (adapter->AddressLength == 6) {
+            int nonzero = 0;
+            for (int i = 0; i < 6; i++) {
+                if (adapter->Address[i] != 0) { nonzero = 1; break; }
+            }
+            if (nonzero) {
                 snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
-                         u.Data4[2], u.Data4[3], u.Data4[4],
-                         u.Data4[5], u.Data4[6], u.Data4[7]);
+                         adapter->Address[0], adapter->Address[1], adapter->Address[2],
+                         adapter->Address[3], adapter->Address[4], adapter->Address[5]);
+                break;
             }
         }
-        FreeLibrary(hRpc);
+        adapter = adapter->Next;
     }
-
-    /* 方式2: 回退到GetAdaptersInfo枚举网卡 */
-    if (!mac[0]) {
-        DWORD sz = 0;
-        GetAdaptersInfo(NULL, &sz);
-        BYTE *buf = (BYTE *)malloc(sz);
-        PIP_ADAPTER_INFO pinfo = (PIP_ADAPTER_INFO)buf;
-        GetAdaptersInfo(pinfo, &sz);
-        PIP_ADAPTER_INFO adapter = pinfo;
-        while (adapter) {
-            if (adapter->AddressLength == 6) {
-                /* 跳过全零MAC */
-                int nonzero = 0;
-                for (int i = 0; i < 6; i++) {
-                    if (adapter->Address[i] != 0) { nonzero = 1; break; }
-                }
-                if (nonzero) {
-                    snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
-                             adapter->Address[0], adapter->Address[1], adapter->Address[2],
-                             adapter->Address[3], adapter->Address[4], adapter->Address[5]);
-                    break;
-                }
-            }
-            adapter = adapter->Next;
-        }
-        /* 兜底: 使用第一个适配器的MAC(即使全零) */
-        if (!mac[0] && pinfo->AddressLength == 6) {
-            snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
-                     pinfo->Address[0], pinfo->Address[1], pinfo->Address[2],
-                     pinfo->Address[3], pinfo->Address[4], pinfo->Address[5]);
-        }
-        free(buf);
+    if (!mac[0] && pinfo->AddressLength == 6) {
+        snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 pinfo->Address[0], pinfo->Address[1], pinfo->Address[2],
+                 pinfo->Address[3], pinfo->Address[4], pinfo->Address[5]);
     }
+    free(buf);
     mac_to_fingerprint(mac, fp_hex);
+    log_line("MAC地址: %s -> 指纹: %s", mac, fp_hex);
 }
 
 static void generate_device_code(const char *fp_hex, char *out, size_t out_sz) {
@@ -2746,23 +2717,6 @@ static void generate_device_code(const char *fp_hex, char *out, size_t out_sz) {
  */
 static int get_all_macs(char macs[][32], int max_macs) {
     int count = 0;
-    /* 通过UuidCreateSequential获取第一个MAC */
-    HMODULE hRpc = LoadLibraryA("rpcrt4.dll");
-    if (hRpc) {
-        FnUuidCreateSequential pUuidCreateSeq = (FnUuidCreateSequential)GetProcAddress(hRpc, "UuidCreateSequential");
-        if (pUuidCreateSeq) {
-            UUID u;
-            RPC_STATUS rs = pUuidCreateSeq(&u);
-            if ((rs == 0 || rs == RPC_S_UUID_LOCAL_ONLY) && count < max_macs) {
-                snprintf(macs[count], 32, "%02x:%02x:%02x:%02x:%02x:%02x",
-                         u.Data4[2], u.Data4[3], u.Data4[4],
-                         u.Data4[5], u.Data4[6], u.Data4[7]);
-                count++;
-            }
-        }
-        FreeLibrary(hRpc);
-    }
-    /* 通过GetAdaptersInfo获取所有网卡MAC(去重) */
     DWORD sz = 0;
     GetAdaptersInfo(NULL, &sz);
     BYTE *buf = (BYTE *)malloc(sz);
