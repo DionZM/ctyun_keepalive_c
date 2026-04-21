@@ -29,7 +29,7 @@
  *   /LTCG - 链接时代码生成(Link-Time Code Generation)，与/GL配合使用获得最佳性能
  *   相比1.2.1及之前版本，可提升5-10%运行性能，减小可执行文件体积
  *
- * 版本: 1.2.2
+ * 版本: 1.3.0
  */
 
 /* ======================== 标准库与系统头文件 ======================== */
@@ -44,6 +44,7 @@
 #include <ws2tcpip.h>      /* Winsock2 扩展 (InetPton等) */
 #include <wincrypt.h>      /* CryptoAPI (SHA256, MD5, 随机数) */
 #include <windows.h>       /* Windows基础API */
+#include <psapi.h>         /* Process Status API (内存信息) */
 #include <winhttp.h>       /* WinHTTP (HTTP/WebSocket客户端) */
 #include <bcrypt.h>        /* CNG API (RSA-OAEP加密) */
 #include <iphlpapi.h>      /* 网络适配器信息 (GetAdaptersInfo) */
@@ -69,12 +70,20 @@
 #pragma comment(lib, "psapi.lib")       /* Process Status API: 内存信息 */
 
 /* ======================== 常量定义 ======================== */
-#define APP_VERSION   "1.2.4"
+#define APP_VERSION   "1.3.0"
 /*
- * 1.2.4 版本说明:
- * 1. 优化1: 智能trim_working_set调用，只在内存增长超过阈值时才trim
- * 2. 优化2: WinHTTP连接超时设置，减少等待时间
- * 3. 保留1.2.3的所有已有优化
+ * 1.3.0 版本说明:
+ * 1. 修复: hconn句柄泄漏，长时间运行不再累积泄漏
+ * 2. 修复: 连接失败不再错误触发start_event，避免保活线程崩溃
+ * 3. 修复: decrypt_data增加缓冲区大小参数，防止溢出
+ * 4. 修复: WinHttpSetTimeouts参数顺序纠正
+ * 5. 安全: 密钥派生升级为PBKDF2-HMAC-SHA256 (100,000次迭代)
+ * 6. 安全: 新增Windows DPAPI分层加密，绑定用户账户+本机硬件双因素
+ * 7. 优化: sha256_hex/md5_hex/url_encode使用查表法替代sprintf/strchr
+ * 8. 优化: make_sig_headers时间戳只格式化一次
+ * 9. 安全: 移除日志中的验证码明文输出
+ * 10. 安全: md5_hex添加CryptCreateHash返回值检查
+ * 11. 兼容: 自动识别v1.x和v2.0配置格式，无缝升级
  */
 #define MAX_DESKTOPS  10       /* 最大桌面数量 */
 #define CHECK_INTERVAL 180     /* 未运行桌面状态检查间隔(秒)，即3分钟 */
@@ -126,48 +135,6 @@ static SIZE_T g_last_trim_memory_kb = 0;
 /* =============================================================== */
 
 /* ======================== 工具函数 ======================== */
-
-/**
- * trim_working_set - 智能修剪进程工作集，将物理内存页归还OS
- *
- * 优化v1.2.4: 只有当内存增长超过阈值时才调用trim，避免不必要的系统调用
- * 使用GetProcessMemoryInfo获取当前内存使用情况进行判断
- *
- * @param force 1=强制trim, 0=智能判断
- */
-static void trim_working_set(int force) {
-    PROCESS_MEMORY_COUNTERS pmc;
-    SIZE_T current_memory_kb = 0;
-    int should_trim = force;
-
-    /* 智能判断模式: 检查内存增长 */
-    if (!force) {
-        HANDLE hProcess = GetCurrentProcess();
-        if (GetProcessMemoryInfo(hProcess, &pmc, sizeof(pmc))) {
-            current_memory_kb = pmc.WorkingSetSize / 1024;
-            /* 如果是第一次或内存增长超过阈值 */
-            if (g_last_trim_memory_kb == 0) {
-                should_trim = 1;
-            } else if (current_memory_kb > g_last_trim_memory_kb + TRIM_MEMORY_THRESHOLD_KB) {
-                should_trim = 1;
-            }
-        }
-    }
-
-    if (should_trim) {
-        SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
-        /* 更新上次trim时的内存使用量 */
-        if (!force) {
-            HANDLE hProcess = GetCurrentProcess();
-            if (GetProcessMemoryInfo(hProcess, &pmc, sizeof(pmc))) {
-                g_last_trim_memory_kb = pmc.WorkingSetSize / 1024;
-                log_line("内存智能trim: 从%lluKB降至%lluKB", 
-                        (unsigned long long)current_memory_kb, 
-                        (unsigned long long)g_last_trim_memory_kb);
-            }
-        }
-    }
-}
 
 static void refresh_banner(void) {
     if (g_background) return;
@@ -329,6 +296,48 @@ static void log_line(const char *fmt, ...) {
     }
 }
 
+/**
+ * trim_working_set - 智能修剪进程工作集，将物理内存页归还OS
+ *
+ * 优化v1.2.4: 只有当内存增长超过阈值时才调用trim，避免不必要的系统调用
+ * 使用GetProcessMemoryInfo获取当前内存使用情况进行判断
+ *
+ * @param force 1=强制trim, 0=智能判断
+ */
+static void trim_working_set(int force) {
+    PROCESS_MEMORY_COUNTERS pmc;
+    SIZE_T current_memory_kb = 0;
+    int should_trim = force;
+
+    /* 智能判断模式: 检查内存增长 */
+    if (!force) {
+        HANDLE hProcess = GetCurrentProcess();
+        if (GetProcessMemoryInfo(hProcess, &pmc, sizeof(pmc))) {
+            current_memory_kb = pmc.WorkingSetSize / 1024;
+            /* 如果是第一次或内存增长超过阈值 */
+            if (g_last_trim_memory_kb == 0) {
+                should_trim = 1;
+            } else if (current_memory_kb > g_last_trim_memory_kb + TRIM_MEMORY_THRESHOLD_KB) {
+                should_trim = 1;
+            }
+        }
+    }
+
+    if (should_trim) {
+        SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+        /* 更新上次trim时的内存使用量 */
+        if (!force) {
+            HANDLE hProcess = GetCurrentProcess();
+            if (GetProcessMemoryInfo(hProcess, &pmc, sizeof(pmc))) {
+                g_last_trim_memory_kb = pmc.WorkingSetSize / 1024;
+                log_line("内存智能trim: 从%lluKB降至%lluKB", 
+                        (unsigned long long)current_memory_kb, 
+                        (unsigned long long)g_last_trim_memory_kb);
+            }
+        }
+    }
+}
+
 /* ======================== 加密基础函数 ======================== */
 
 /**
@@ -360,6 +369,8 @@ static void sha256(const uint8_t *d, size_t n, uint8_t *out) {
     CryptDestroyHash(h);
 }
 
+static const char HEX_LUT[] = "0123456789abcdef";
+
 /**
  * url_encode - URL编码
  *
@@ -372,13 +383,28 @@ static void sha256(const uint8_t *d, size_t n, uint8_t *out) {
  * @return       编码后字符串长度
  */
 static size_t url_encode(const char *in, char *out, size_t out_sz) {
-    static const char *safe = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~";
+    static const uint8_t URL_SAFE[256] = {
+        ['A']=1,['B']=1,['C']=1,['D']=1,['E']=1,['F']=1,['G']=1,['H']=1,
+        ['I']=1,['J']=1,['K']=1,['L']=1,['M']=1,['N']=1,['O']=1,['P']=1,
+        ['Q']=1,['R']=1,['S']=1,['T']=1,['U']=1,['V']=1,['W']=1,['X']=1,
+        ['Y']=1,['Z']=1,
+        ['a']=1,['b']=1,['c']=1,['d']=1,['e']=1,['f']=1,['g']=1,['h']=1,
+        ['i']=1,['j']=1,['k']=1,['l']=1,['m']=1,['n']=1,['o']=1,['p']=1,
+        ['q']=1,['r']=1,['s']=1,['t']=1,['u']=1,['v']=1,['w']=1,['x']=1,
+        ['y']=1,['z']=1,
+        ['0']=1,['1']=1,['2']=1,['3']=1,['4']=1,['5']=1,['6']=1,['7']=1,
+        ['8']=1,['9']=1,
+        ['-']=1,['_']=1,['.']=1,['~']=1
+    };
     size_t j = 0;
     for (size_t i = 0; in[i] && j < out_sz - 4; i++) {
-        if (strchr(safe, in[i])) {
+        unsigned char c = (unsigned char)in[i];
+        if (URL_SAFE[c]) {
             out[j++] = in[i];
         } else {
-            j += snprintf(out + j, out_sz - j, "%%%02X", (unsigned char)in[i]);
+            out[j++] = '%';
+            out[j++] = HEX_LUT[c >> 4];
+            out[j++] = HEX_LUT[c & 0x0F];
         }
     }
     out[j] = 0;
@@ -394,7 +420,10 @@ static size_t url_encode(const char *in, char *out, size_t out_sz) {
 static void sha256_hex(const char *s, char *out) {
     uint8_t d[32];
     sha256((const uint8_t *)s, strlen(s), d);
-    for (int i = 0; i < 32; i++) sprintf(out + i * 2, "%02x", d[i]);
+    for (int i = 0; i < 32; i++) {
+        out[i * 2] = HEX_LUT[d[i] >> 4];
+        out[i * 2 + 1] = HEX_LUT[d[i] & 0x0F];
+    }
     out[64] = 0;
 }
 
@@ -408,13 +437,16 @@ static void sha256_hex(const char *s, char *out) {
  */
 static void md5_hex(const char *s, char *out) {
     HCRYPTHASH h;
-    CryptCreateHash(g_crypt, CALG_MD5, 0, 0, &h);
+    if (!CryptCreateHash(g_crypt, CALG_MD5, 0, 0, &h)) { out[0] = 0; return; }
     CryptHashData(h, (BYTE *)s, (DWORD)strlen(s), 0);
     uint8_t d[16];
     DWORD dl = 16;
-    CryptGetHashParam(h, HP_HASHVAL, d, &dl, 0);
+    if (!CryptGetHashParam(h, HP_HASHVAL, d, &dl, 0)) { CryptDestroyHash(h); out[0] = 0; return; }
     CryptDestroyHash(h);
-    for (int i = 0; i < 16; i++) sprintf(out + i * 2, "%02x", d[i]);
+    for (int i = 0; i < 16; i++) {
+        out[i * 2] = HEX_LUT[d[i] >> 4];
+        out[i * 2 + 1] = HEX_LUT[d[i] & 0x0F];
+    }
     out[32] = 0;
 }
 
@@ -837,10 +869,7 @@ static int http_init(void) {
                           WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!g_inet) return 0;
 
-    /* 优化v1.2.4: 设置WinHTTP超时参数 */
-    DWORD timeout_ms;
-    timeout_ms = WINHTTP_CONNECT_TIMEOUT_MS;
-    WinHttpSetTimeouts(g_inet, timeout_ms, WINHTTP_SEND_TIMEOUT_MS, WINHTTP_RECEIVE_TIMEOUT_MS, 0);
+    WinHttpSetTimeouts(g_inet, 0, WINHTTP_CONNECT_TIMEOUT_MS, WINHTTP_SEND_TIMEOUT_MS, WINHTTP_RECEIVE_TIMEOUT_MS);
     return 1;
 }
 
@@ -951,14 +980,8 @@ static int http_req(const char *method, const char *url, const char *body, size_
     }
     resp[total] = 0;
 
-    /*
-     * 优化4 (v1.2.2): 延迟关闭连接句柄。
-     * 原逻辑: WinHttpCloseHandle(hreq); WinHttpCloseHandle(hconn);
-     * 新逻辑: 只关闭请求句柄，连接句柄由WinHTTP会话自动管理复用。
-     * 这样同一目标服务器的后续请求可以复用现有TCP连接，避免重复握手。
-     */
     WinHttpCloseHandle(hreq);
-    /* hconn不立即关闭，由WinHTTP底层连接池管理，默认保持一段时间 */
+    WinHttpCloseHandle(hconn);
     return (int)total;
 }
 
@@ -1013,11 +1036,8 @@ static int http_get_binary(const char *url, const char **hdrs, int nhdrs,
         total += n;
         if (total >= rsz) break;
     }
-    /*
-     * 优化4 (v1.2.2): 延迟关闭连接句柄，复用TCP连接。
-     * 与http_req()采用相同的策略，hconn由WinHTTP底层连接池管理。
-     */
     WinHttpCloseHandle(hreq);
+    WinHttpCloseHandle(hconn);
     return (int)total;
 }
 
@@ -1078,7 +1098,7 @@ static void make_sig_headers(const Session *s, const char **hdrs, int *nhdrs) {
     snprintf(g_sh4, sizeof(g_sh4), "ctg-userid: %d", s->user_id);
     snprintf(g_sh6, sizeof(g_sh6), "ctg-tenantid: %d", s->tenant_id);
     snprintf(g_shts, sizeof(g_shts), "ctg-timestamp: %lld", ts);
-    snprintf(g_shri, sizeof(g_shri), "ctg-requestid: %lld", ts);
+    snprintf(g_shri, sizeof(g_shri), "ctg-requestid: %s", g_shts + sizeof("ctg-timestamp: ") - 1);
     snprintf(g_shcombined, sizeof(g_shcombined), "60%lld%d%lld%d103020001%s",
              ts, s->tenant_id, ts, s->user_id, s->secret_key);
     md5_hex(g_shcombined, g_shsig_hex);
@@ -1472,7 +1492,7 @@ static int try_captcha_ocr(const Session *s, const char *user,
         log_line("OCR识别结果为空");
         return 1;
     }
-    log_line("OCR识别结果: %s", captcha_out);
+    log_line("OCR识别成功，长度=%d", (int)strlen(captcha_out));
     return 2;
 }
 
@@ -2595,16 +2615,19 @@ static int aead_open(const uint8_t *ct, size_t ctlen, const uint8_t key[32],
  * @param out   输出明文字符串
  * @return      1=解密成功, 0=解密失败
  */
-static int decrypt_data(const char *b64, const uint8_t key[32], char *out) {
+static int decrypt_data(const char *b64, const uint8_t key[32], char *out, size_t out_sz) {
     size_t b64len = strlen(b64);
     uint8_t *data = (uint8_t *)malloc(b64len);
     size_t dlen = b64dec(b64, b64len, data);
-    /* 最小长度: nonce(12) + tag(16) = 28字节 */
     if (dlen < 12 + 16) { free(data); return 0; }
     uint8_t *pt = (uint8_t *)malloc(dlen);
-    /* data前12字节为nonce，之后为密文+tag */
     int ok = aead_open(data + 12, dlen - 12, key, data, pt);
-    if (ok) strcpy(out, (char *)pt);
+    if (ok) {
+        size_t pt_len = dlen - 12 - 16;
+        if (pt_len >= out_sz) pt_len = out_sz - 1;
+        memcpy(out, pt, pt_len);
+        out[pt_len] = '\0';
+    }
     free(pt);
     free(data);
     return ok;
@@ -2775,39 +2798,146 @@ static int get_all_macs(char macs[][32], int max_macs) {
 }
 
 /**
- * derive_key - 从指纹和盐值派生加密密钥
+ * derive_key - 从指纹和盐值派生加密密钥 (v2.0: 使用PBKDF2替代简单SHA256)
  *
- * 使用 SHA256(指纹|盐值) 派生32字节密钥。
- * 指纹确保密钥与本机绑定，盐值增加随机性。
+ * 相比v1.x的 SHA256(fp|salt)，v2.0使用PBKDF2-HMAC-SHA256:
+ *   - 100,000次迭代，大幅增加暴力破解成本
+ *   - 符合NIST SP 800-132标准
+ *   - 使用HMAC-SHA256而非裸SHA256
+ *
+ * 回退机制: 若BCrypt不可用，回退到v1.x的derive_key_legacy
  *
  * @param fp    本机指纹(64字符十六进制)
  * @param salt  盐值(32字符十六进制)
  * @param key   输出32字节密钥
  */
-static void derive_key(const char *fp, const char *salt, uint8_t key[32]) {
+static void derive_key_legacy(const char *fp, const char *salt, uint8_t key[32]) {
     char material[256];
     snprintf(material, sizeof(material), "%s|%s", fp, salt);
     sha256((const uint8_t *)material, strlen(material), key);
 }
 
+static void derive_key(const char *fp, const char *salt, uint8_t key[32]) {
+    BCRYPT_ALG_HANDLE hAlg = NULL;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, NULL, BCRYPT_ALG_HANDLE_HMAC_FLAG);
+    if (!BCRYPT_SUCCESS(status)) {
+        derive_key_legacy(fp, salt, key);
+        return;
+    }
+
+    ULONGLONG iterations = 100000;
+
+    status = BCryptDeriveKeyPBKDF2(
+        hAlg,
+        (PUCHAR)fp, (ULONG)strlen(fp),
+        (PUCHAR)salt, (ULONG)strlen(salt),
+        iterations,
+        key, 32,
+        0
+    );
+
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+
+    if (!BCRYPT_SUCCESS(status)) {
+        derive_key_legacy(fp, salt, key);
+    }
+}
+
+/* ======================== Windows DPAPI 加密 (v2.0新增) ======================== */
+
 /**
- * try_decrypt_config - 尝试用指定指纹解密config.json
+ * protect_data_dpapi - 使用Windows DPAPI加密数据
+ *
+ * DPAPI优势:
+ * 1. 密钥由Windows自动管理，绑定当前用户账户
+ * 2. 使用用户登录密码作为根密钥
+ * 3. 支持可选的额外熵（本机指纹）
+ * 4. 无需自己管理密钥派生
+ * 5. 符合企业安全策略
+ *
+ * 注意: 不使用CRYPTPROTECT_LOCAL_MACHINE，确保绑定到当前用户
+ *       同一台机器的其他用户无法解密
+ *
+ * @param plaintext   明文数据
+ * @param plain_len   明文长度
+ * @param entropy     额外熵（可选，提高安全性）
+ * @param out         输出加密数据（需调用LocalFree释放）
+ * @param out_len     输出长度
+ * @return            1=成功, 0=失败
+ */
+static int protect_data_dpapi(const uint8_t *plaintext, DWORD plain_len,
+                               const char *entropy,
+                               uint8_t **out, DWORD *out_len) {
+    DATA_BLOB data_in = { plain_len, (BYTE *)plaintext };
+    DATA_BLOB data_out = { 0, NULL };
+
+    DATA_BLOB entropy_blob = { 0, NULL };
+    if (entropy && entropy[0]) {
+        entropy_blob.cbData = (DWORD)strlen(entropy);
+        entropy_blob.pbData = (BYTE *)entropy;
+    }
+
+    DWORD flags = CRYPTPROTECT_UI_FORBIDDEN;
+
+    BOOL result = CryptProtectData(
+        &data_in,
+        L"ctyun_keepalive_credentials",
+        entropy ? &entropy_blob : NULL,
+        NULL, NULL, flags, &data_out
+    );
+
+    if (result) {
+        *out = data_out.pbData;
+        *out_len = data_out.cbData;
+        return 1;
+    }
+    return 0;
+}
+
+/**
+ * unprotect_data_dpapi - 使用Windows DPAPI解密数据
+ */
+static int unprotect_data_dpapi(const uint8_t *ciphertext, DWORD cipher_len,
+                                 const char *entropy,
+                                 uint8_t **out, DWORD *out_len) {
+    DATA_BLOB data_in = { cipher_len, (BYTE *)ciphertext };
+    DATA_BLOB data_out = { 0, NULL };
+
+    DATA_BLOB entropy_blob = { 0, NULL };
+    if (entropy && entropy[0]) {
+        entropy_blob.cbData = (DWORD)strlen(entropy);
+        entropy_blob.pbData = (BYTE *)entropy;
+    }
+
+    DWORD flags = CRYPTPROTECT_UI_FORBIDDEN;
+
+    BOOL result = CryptUnprotectData(
+        &data_in, NULL,
+        entropy ? &entropy_blob : NULL,
+        NULL, NULL, flags, &data_out
+    );
+
+    if (result) {
+        *out = data_out.pbData;
+        *out_len = data_out.cbData;
+        return 1;
+    }
+    return 0;
+}
+
+/**
+ * try_decrypt_config_legacy - v1.x 配置解密 (ChaCha20-Poly1305)
  *
  * 从config.json中提取salt和加密的账号信息，
  * 用给定指纹派生密钥，尝试解密并自动登录。
- *
- * @param s        会话信息(输出device_code和登录结果)
- * @param content  config.json文件内容
- * @param fp       本机指纹
- * @return         1=解密并登录成功, 0=失败
  */
-static int try_decrypt_config(Session *s, const char *content, const char *fp) {
+static int try_decrypt_config_legacy(Session *s, const char *content, const char *fp) {
     char salt[65];
     jstr(content, "salt", salt, sizeof(salt));
     if (!salt[0]) return 0;
 
     uint8_t key[32];
-    derive_key(fp, salt, key);
+    derive_key_legacy(fp, salt, key);
 
     const char *acc = strstr(content, "\"accounts\"");
     if (!acc) return 0;
@@ -2822,12 +2952,13 @@ static int try_decrypt_config(Session *s, const char *content, const char *fp) {
     jstr(obj, "device_code", dc, sizeof(dc));
 
     char user[256], pass[256], devc[256];
-    int du = decrypt_data(ua, key, user);
-    int dp = decrypt_data(pw, key, pass);
-    int dd = decrypt_data(dc, key, devc);
+    int du = decrypt_data(ua, key, user, sizeof(user));
+    int dp = decrypt_data(pw, key, pass, sizeof(pass));
+    int dd = decrypt_data(dc, key, devc, sizeof(devc));
 
     if (du && dp && dd) {
-        strcpy(s->device_code, devc);
+        strncpy(s->device_code, devc, sizeof(s->device_code) - 1);
+        s->device_code[sizeof(s->device_code) - 1] = '\0';
         strncpy(s->phone_number, user, sizeof(s->phone_number) - 1);
         s->phone_number[sizeof(s->phone_number) - 1] = '\0';
         if (do_login(s, user, pass)) return 1;
@@ -2835,6 +2966,102 @@ static int try_decrypt_config(Session *s, const char *content, const char *fp) {
         return 2;
     }
     return 0;
+}
+
+/**
+ * try_decrypt_config_dpapi - v2.0 配置解密 (DPAPI + ChaCha20-Poly1305 分层加密)
+ *
+ * 新格式使用两层加密:
+ * 外层: Windows DPAPI (绑定用户账户)
+ * 内层: ChaCha20-Poly1305 (绑定本机硬件)
+ *
+ * 即使DPAPI被绕过，仍需硬件指纹才能解密
+ */
+static int try_decrypt_config_dpapi(Session *s, const char *content, const char *fp) {
+    char dpapi_b64_small[256];
+    jstr(content, "dpapi", dpapi_b64_small, sizeof(dpapi_b64_small));
+    if (!dpapi_b64_small[0]) return 0;
+
+    const char *dpapi_start = strstr(content, "\"dpapi\"");
+    if (!dpapi_start) return 0;
+    dpapi_start += strlen("\"dpapi\"");
+    while (*dpapi_start == ' ' || *dpapi_start == ':') dpapi_start++;
+    if (*dpapi_start != '"') return 0;
+    dpapi_start++;
+    const char *dpapi_end = strchr(dpapi_start, '"');
+    if (!dpapi_end) return 0;
+    size_t dpapi_len = (size_t)(dpapi_end - dpapi_start);
+
+    uint8_t *dpapi_ct = (uint8_t *)malloc(dpapi_len);
+    if (!dpapi_ct) return 0;
+    size_t dpapi_ct_len = b64dec(dpapi_start, dpapi_len, dpapi_ct);
+    if (dpapi_ct_len == 0) { free(dpapi_ct); return 0; }
+
+    uint8_t *inner_data = NULL;
+    DWORD inner_len = 0;
+    if (!unprotect_data_dpapi(dpapi_ct, (DWORD)dpapi_ct_len, fp, &inner_data, &inner_len)) {
+        log_line("DPAPI解密失败，可能需要重新登录");
+        free(dpapi_ct);
+        return 0;
+    }
+    free(dpapi_ct);
+
+    char *inner_json = (char *)malloc(inner_len + 1);
+    if (!inner_json) { LocalFree(inner_data); return 0; }
+    memcpy(inner_json, inner_data, inner_len);
+    inner_json[inner_len] = '\0';
+    LocalFree(inner_data);
+
+    char salt[65];
+    jstr(inner_json, "salt", salt, sizeof(salt));
+    if (!salt[0]) { free(inner_json); return 0; }
+
+    const char *acc = strstr(inner_json, "\"accounts\"");
+    if (!acc) { free(inner_json); return 0; }
+    acc = strchr(acc, '[');
+    if (!acc) { free(inner_json); return 0; }
+    const char *obj = strchr(acc, '{');
+    if (!obj) { free(inner_json); return 0; }
+
+    char ua[2048], pw[2048], dc[2048];
+    jstr(obj, "user_account", ua, sizeof(ua));
+    jstr(obj, "password", pw, sizeof(pw));
+    jstr(obj, "device_code", dc, sizeof(dc));
+
+    uint8_t key[32];
+    derive_key(fp, salt, key);
+
+    char user[256], pass[256], devc[256];
+    int du = decrypt_data(ua, key, user, sizeof(user));
+    int dp = decrypt_data(pw, key, pass, sizeof(pass));
+    int dd = decrypt_data(dc, key, devc, sizeof(devc));
+
+    free(inner_json);
+
+    if (du && dp && dd) {
+        strncpy(s->device_code, devc, sizeof(s->device_code) - 1);
+        s->device_code[sizeof(s->device_code) - 1] = '\0';
+        strncpy(s->phone_number, user, sizeof(s->phone_number) - 1);
+        s->phone_number[sizeof(s->phone_number) - 1] = '\0';
+        if (do_login(s, user, pass)) return 1;
+        log_line("自动登录失败，尝试手动输入");
+        return 2;
+    }
+    return 0;
+}
+
+/**
+ * try_decrypt_config - 统一配置解密入口
+ *
+ * 优先尝试v2.0 DPAPI格式，失败时回退到v1.x ChaCha20格式
+ */
+static int try_decrypt_config(Session *s, const char *content, const char *fp) {
+    /* 先尝试v2.0 DPAPI格式 */
+    int result = try_decrypt_config_dpapi(s, content, fp);
+    if (result != 0) return result;
+
+    /* 回退到v1.x传统格式 */
+    return try_decrypt_config_legacy(s, content, fp);
 }
 
 /**
@@ -2971,12 +3198,49 @@ static int resolve_credentials(Session *s) {
         encrypt_data(pass, key, enc_pass);
         encrypt_data(s->device_code, key, enc_dc);
 
+        char *inner_json = (char *)malloc(8192);
+        int dpapi_ok = 0;
+        uint8_t *dpapi_ct = NULL;
+        DWORD dpapi_len = 0;
+
+        if (inner_json) {
+            snprintf(inner_json, 8192,
+                     "{\"salt\":\"%s\",\"accounts\":[{\"user_account\":\"%s\",\"password\":\"%s\",\"device_code\":\"%s\"}]}",
+                     salt, enc_user, enc_pass, enc_dc);
+
+            dpapi_ok = protect_data_dpapi(
+                (const uint8_t *)inner_json, (DWORD)strlen(inner_json),
+                fp, &dpapi_ct, &dpapi_len
+            );
+            free(inner_json);
+        }
+
         f = fopen(config_path, "w");
         if (f) {
-            fprintf(f, "{\"salt\":\"%s\",\"accounts\":[{\"user_account\":\"%s\",\"password\":\"%s\",\"device_code\":\"%s\"}]}",
-                    salt, enc_user, enc_pass, enc_dc);
+            if (dpapi_ok && dpapi_ct) {
+                size_t b64_need = ((size_t)dpapi_len + 2) / 3 * 4 + 1;  // +1 for '\0'
+                char *dpapi_b64 = (char *)malloc(b64_need);
+                if (dpapi_b64) {
+                    b64enc(dpapi_ct, dpapi_len, dpapi_b64);
+                    fprintf(f, "{\"version\":2,\"dpapi\":\"%s\"}", dpapi_b64);
+                    free(dpapi_b64);
+                    log_line("配置已保存(v2.0 DPAPI加密)");
+                } else {
+                    fprintf(f, "{\"salt\":\"%s\",\"accounts\":[{\"user_account\":\"%s\",\"password\":\"%s\",\"device_code\":\"%s\"}]}",
+                            salt, enc_user, enc_pass, enc_dc);
+                    log_line("内存不足，已保存(v1.x ChaCha20加密)");
+                    dpapi_ok = 0;
+                }
+                LocalFree(dpapi_ct);
+            } else {
+                fprintf(f, "{\"salt\":\"%s\",\"accounts\":[{\"user_account\":\"%s\",\"password\":\"%s\",\"device_code\":\"%s\"}]}",
+                        salt, enc_user, enc_pass, enc_dc);
+                log_line("DPAPI不可用，已保存(v1.x ChaCha20加密)");
+            }
             fclose(f);
             log_line("配置已保存至 %s", config_path);
+        } else if (dpapi_ok && dpapi_ct) {
+            LocalFree(dpapi_ct);
         }
     } else {
         log_line("隐私模式已启用，不保存凭据");
@@ -3781,8 +4045,7 @@ int main(int argc, char *argv[]) {
                 log_line("[%s] 运行中，开始保活", desktops[i].desktop_code);
                 SetEvent(desktops[i].start_event);
             } else {
-                log_line("[%s] 连接失败，标记为未激活等待轮询", desktops[i].desktop_code);
-                SetEvent(desktops[i].start_event);
+                log_line("[%s] 连接失败，等待统一轮询重试", desktops[i].desktop_code);
             }
         } else {
             log_line("[%s] 已关机，等待统一轮询激活", desktops[i].desktop_code);
