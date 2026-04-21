@@ -68,14 +68,12 @@
 #pragma comment(lib, "gdi32.lib")       /* GDI: CreateDIBSection, StretchBlt */
 
 /* ======================== 常量定义 ======================== */
-#define APP_VERSION   "1.2.2"
+#define APP_VERSION   "1.2.3"
 /*
- * 1.2.2 版本说明:
- * 1. 优化1: 修复desktop_cleanup时序问题，先SetEvent唤醒线程再CloseHandle
- * 2. 优化2: 编译器优化，启用全程序优化(/GL)和链接时代码生成(/LTCG)
- * 3. 优化3: 桌面ID哈希查找，减少monitor_desktops_thread中的strcmp开销
- * 4. 优化4: HTTP连接复用，减少TCP握手开销
- * 5. 优化5: JSON单次扫描解析，减少重复扫描
+ * 1.2.3 版本说明:
+ * 1. 优化1: DesktopLight添加id_hash预计算，monitor线程直接使用，减少重复hash
+ * 2. 优化2: do_login中密码哈希提前预计算，避免手工/自动两个分支重复计算
+ * 3. 保留1.2.2的所有已有优化
  */
 #define MAX_DESKTOPS  10       /* 最大桌面数量 */
 #define CHECK_INTERVAL 180     /* 未运行桌面状态检查间隔(秒)，即3分钟 */
@@ -617,12 +615,13 @@ typedef struct {
  * DesktopLight - 桌面信息(轻量版)
  *
  * 仅包含状态轮询所需的最小字段，用于check_desktop_thread中
- * 定期查询桌面状态。每个实例仅132字节，远小于Desktop的~200B+动态内存。
+ * 定期查询桌面状态。每个实例仅136字节，远小于Desktop的~200B+动态内存。
  */
 typedef struct {
     char desktop_id[64];      /* 桌面唯一标识 */
     char desktop_code[64];    /* 桌面编码 */
     int is_active;            /* 是否运行中 */
+    uint32_t id_hash;         /* 优化 (v1.2.3): desktop_id的FNV-1a哈希值，用于快速查找 */
 } DesktopLight;
 
 /**
@@ -1472,6 +1471,21 @@ static int do_login(Session *s, const char *user, const char *pwd) {
         jstr(resp, "challengeCode", ccode, sizeof(ccode));
         if (!cid[0]) { log_line("挑战码为空"); continue; }
 
+        /* 优化 (v1.2.3): 提前预计算所有密码哈希，避免手工/自动两个分支重复计算 */
+        char final_sha[65], sha2_pwd[65];
+        {
+            char combined[512];
+            snprintf(combined, sizeof(combined), "%s%s", pwd, ccode);
+            sha256_hex(combined, final_sha);
+
+            char pwd_sha[65];
+            sha256_hex(pwd, pwd_sha);
+
+            char sha2_combined[512];
+            snprintf(sha2_combined, sizeof(sha2_combined), "%s%s", pwd_sha, ccode);
+            sha256_hex(sha2_combined, sha2_pwd);
+        }
+
         char captcha[64] = "";
         uint8_t *img_data = NULL;
         int img_len = 0;
@@ -1495,17 +1509,6 @@ static int do_login(Session *s, const char *user, const char *pwd) {
                     continue;
                 }
                 close_captcha_window();
-
-                char combined[512], final_sha[65];
-                snprintf(combined, sizeof(combined), "%s%s", pwd, ccode);
-                sha256_hex(combined, final_sha);
-
-                char pwd_sha[65];
-                sha256_hex(pwd, pwd_sha);
-
-                char sha2_combined[512], sha2_pwd[65];
-                snprintf(sha2_combined, sizeof(sha2_combined), "%s%s", pwd_sha, ccode);
-                sha256_hex(sha2_combined, sha2_pwd);
 
                 char enc_cid[512], enc_dc[512];
                 url_encode(cid, enc_cid, sizeof(enc_cid));
@@ -1567,17 +1570,6 @@ static int do_login(Session *s, const char *user, const char *pwd) {
         }
 
         if (img_data) { free(img_data); img_data = NULL; }
-
-        char combined[512], final_sha[65];
-        snprintf(combined, sizeof(combined), "%s%s", pwd, ccode);
-        sha256_hex(combined, final_sha);
-
-        char pwd_sha[65];
-        sha256_hex(pwd, pwd_sha);
-
-        char sha2_combined[512], sha2_pwd[65];
-        snprintf(sha2_combined, sizeof(sha2_combined), "%s%s", pwd_sha, ccode);
-        sha256_hex(sha2_combined, sha2_pwd);
 
         char enc_cid[512], enc_dc[512];
         url_encode(cid, enc_cid, sizeof(enc_cid));
@@ -2100,6 +2092,8 @@ static int get_desktop_list_light(Session *s, DesktopLight *desktops, int max) {
         jstr_range(obj, end + 1, "desktopId", desktops[count].desktop_id, sizeof(desktops[count].desktop_id));
         if (!desktops[count].desktop_id[0])
             jstr_range(obj, end + 1, "objId", desktops[count].desktop_id, sizeof(desktops[count].desktop_id));
+        /* 优化 (v1.2.3): 预计算desktop_id的FNV-1a哈希值，后续轮询时直接使用 */
+        desktops[count].id_hash = fnv1a_hash(desktops[count].desktop_id);
         jstr_range(obj, end + 1, "desktopCode", desktops[count].desktop_code, sizeof(desktops[count].desktop_code));
         char status[64];
         jstr_range(obj, end + 1, "useStatusText", status, sizeof(status));
@@ -3554,6 +3548,7 @@ static DWORD WINAPI monitor_desktops_thread(LPVOID param) {
             if (InterlockedCompareExchange(&d->keepalive_started, 0, 0)) continue;
 
             /*
+             * 优化 (v1.2.3): 直接使用预计算的id_hash，不再每次调用fnv1a_hash()
              * 优化3 (v1.2.2): 先比较哈希值，再进行strcmp验证。
              * FNV-1a哈希32位碰撞率极低(~1/40亿)，大多数情况下哈希不匹配直接跳过。
              * 只有哈希命中时才调用strcmp进行精确比较，大幅减少字符串比较次数。
@@ -3561,8 +3556,7 @@ static DWORD WINAPI monitor_desktops_thread(LPVOID param) {
              */
             uint32_t target_hash = d->id_hash;  /* 缓存目标哈希，避免重复访问 */
             for (int j = 0; j < n; j++) {
-                uint32_t hash = fnv1a_hash(tmp[j].desktop_id);
-                if (hash == target_hash && strcmp(tmp[j].desktop_id, d->desktop_id) == 0) {
+                if (tmp[j].id_hash == target_hash && strcmp(tmp[j].desktop_id, d->desktop_id) == 0) {
                     found = 1;
                     active = tmp[j].is_active;
                     break;
