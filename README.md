@@ -36,9 +36,9 @@
    - 连续3次自动识别验证失败
 3. **手工输入模式**：
    - 前台弹出验证码图片窗口
-   - 命令行输出提示："验证码自动识别失败，请手工输入："
+   - 命令行输出提示：\"验证码自动识别失败，请手工输入：\"
    - 用户输入后自动关闭窗口
-4. **失败退出**：手工输入连续3次失败，输出"验证码识别错误"并退出程序
+4. **失败退出**：手工输入连续3次失败，输出\"验证码识别错误\"并退出程序
 
 ## 命令行参数
 
@@ -94,7 +94,7 @@ ctyun_keepalive.exe /p
 
 ### 编译命令 (MSVC x64)
 
-打开"x64 Native Tools Command Prompt"，执行：
+打开\"x64 Native Tools Command Prompt\"，执行：
 
 ```batch
 cl /O2 /MD /GS- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8 /GL ctyun_keepalive.c ^
@@ -108,8 +108,8 @@ cl /O2 /MD /GS- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8 /GL ctyun_keepalive.c 
 
 ```batch
 mkdir bin 2>nul
-cl /O2 /MD /GS- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8 /GL /Fo"bin\ctyun_keepalive.obj" ctyun_keepalive.c ^
-   /link /SUBSYSTEM:CONSOLE /STACK:131072,131072 /OPT:REF /OPT:ICF /LTCG /OUT:"bin\ctyun_keepalive.exe" ^
+cl /O2 /MD /GS- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8 /GL /Fo\"bin\\ctyun_keepalive.obj\" ctyun_keepalive.c ^
+   /link /SUBSYSTEM:CONSOLE /STACK:131072,131072 /OPT:REF /OPT:ICF /LTCG /OUT:\"bin\\ctyun_keepalive.exe\" ^
    winhttp.lib ws2_32.lib crypt32.lib advapi32.lib iphlpapi.lib bcrypt.lib ole32.lib windowscodecs.lib user32.lib gdi32.lib
 ```
 
@@ -117,11 +117,11 @@ cl /O2 /MD /GS- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8 /GL /Fo"bin\ctyun_keep
 
 | 优化项                | 说明                                  |
 | ------------------ | ----------------------------------- |
-| Desktop 动态指针       | 证书等字段改为 char\*，保活阶段 free() 真正释放物理内存 |
+| Desktop 动态指针       | 证书等字段改为 char*，保活阶段 free() 真正释放物理内存 |
 | DesktopLight 轻量结构  | 状态轮询使用 132 字节轻量结构，减少内存占用            |
-| connect\_msg 精确分配  | 按需计算大小，替代固定 12KB 缓冲区                |
-| ws\_uri 预构建        | 保活阶段释放 host/port/clink\_host        |
-| trim\_working\_set | 定期将物理内存页归还操作系统                      |
+| connect_msg 精确分配  | 按需计算大小，替代固定 12KB 缓冲区                |
+| ws_uri 预构建        | 保活阶段释放 host/port/clink_host        |
+| trim_working_set | 定期将物理内存页归还操作系统                      |
 | 线程栈缩小              | 128KB 栈替代默认 1MB                     |
 | WS缓冲区堆分配           | 保活循环接收缓冲区改为堆分配，避免每次循环栈分配4KB         |
 | 连接延迟优化             | WebSocket连接后等待时间从500ms降至100ms       |
