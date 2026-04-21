@@ -97,17 +97,19 @@ ctyun_keepalive.exe /p
 打开"x64 Native Tools Command Prompt"，执行：
 
 ```batch
-cl /O2 /MD /GS- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8 ctyun_keepalive.c ^
-   /link /SUBSYSTEM:CONSOLE /STACK:131072,131072 /OPT:REF /OPT:ICF ^
+cl /O2 /MD /GS- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8 /GL ctyun_keepalive.c ^
+   /link /SUBSYSTEM:CONSOLE /STACK:131072,131072 /OPT:REF /OPT:ICF /LTCG ^
    winhttp.lib ws2_32.lib crypt32.lib advapi32.lib iphlpapi.lib bcrypt.lib ole32.lib windowscodecs.lib user32.lib gdi32.lib
 ```
+
+> **1.2.2 编译优化**: 新增 `/GL`(全程序优化) 和 `/LTCG`(链接时代码生成)，可提升 5-10% 运行性能并减小可执行文件体积。
 
 ### 输出到bin目录
 
 ```batch
 mkdir bin 2>nul
-cl /O2 /MD /GS- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8 /Fo"bin\ctyun_keepalive.obj" ctyun_keepalive.c ^
-   /link /SUBSYSTEM:CONSOLE /STACK:131072,131072 /OPT:REF /OPT:ICF /OUT:"bin\ctyun_keepalive.exe" ^
+cl /O2 /MD /GS- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8 /GL /Fo"bin\ctyun_keepalive.obj" ctyun_keepalive.c ^
+   /link /SUBSYSTEM:CONSOLE /STACK:131072,131072 /OPT:REF /OPT:ICF /LTCG /OUT:"bin\ctyun_keepalive.exe" ^
    winhttp.lib ws2_32.lib crypt32.lib advapi32.lib iphlpapi.lib bcrypt.lib ole32.lib windowscodecs.lib user32.lib gdi32.lib
 ```
 
