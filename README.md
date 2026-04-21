@@ -1,12 +1,14 @@
 # 天翼云电脑保活客户端 (C语言版)
 
-自动登录天翼云电脑平台，获取桌面列表，对运行中的桌面建立WebSocket保活连接，对未运行的桌面定时检测状态，开机后自动切换为保活模式。
+如题。
 
-因为需要长时间运行，设计目标是尽可能低占用系统资源。
+为尽可能低占用系统资源，尽管已有rust版本，还是用了C语言重构。
 
 ## 致谢
 
 感谢 [Amamiyashi0n/ctyun\_keepalive](https://github.com/Amamiyashi0n/ctyun_keepalive) 提供的 Python 版本实现，本项目在此基础上用 C 语言进行了重构，再添加特性。
+
+OCR接口直接照搬原脚本，根据github记录，有可能是@leleji提供的服务（如果不是请在issue里提醒我），对大神无私提供的api服务表示表示感谢！
 
 ## 平台支持
 
@@ -14,31 +16,28 @@
 
 ## 功能特性
 
-- 自动登录天翼云电脑（支持验证码OCR自动识别）
-- 验证码OCR失败时弹出独立窗口全分辨率显示，支持手工输入
-- 加密存储用户凭据到 config.json
-- 对运行中桌面保活连接
-- 对未运行桌面每3分钟检测状态，开机后自动保活
+- 自动登录天翼云电脑
+- 验证码识别失败后支持手工输入
+- 加密存储用户凭据
+- 动态监控未运行主机
 - 极低内存占用（保活阶段约 5MB）
 - 支持后台运行模式
 - 支持隐私模式（不保存用户名/密码）
 
 ## 验证码处理机制
 
-程序采用 **OCR优先 + 手工回退** 的验证码处理策略：
+程序采用 **自动识别 + 手工回退** 的验证码处理策略：
 
-1. **OCR自动识别**：调用前辈的第三方OCR服务自动识别验证码
-
-   说明：OCR这个接口按原脚本接口，看起来接口是用ddddocr项目实现的，但是需要自建服务器运行，根据github记录，有可能是@leleji提供的服务（如果不是请在issue里提醒我），对大神无私提供的api服务表示表示感谢！
+1. **自动识别**
 2. **手工输入触发条件**（满足任一即触发）：
-   - OCR接口连接失败（网络超时、连接拒绝等，API服务不可用）
-   - OCR接口返回错误响应
+   - 识别接口连接失败
+   - 识别接口返回错误响应
    - 连续3次自动识别验证失败
 3. **手工输入模式**：
    - 前台弹出验证码图片窗口
-   - 命令行输出提示：\"验证码自动识别失败，请手工输入：\"
+   - 命令行输出提示："验证码自动识别失败，请手工输入："
    - 用户输入后自动关闭窗口
-4. **失败退出**：手工输入连续3次失败，输出\"验证码识别错误\"并退出程序
+4. **失败退出**：手工输入连续3次失败，输出"验证码识别错误"并退出程序
 
 ## 命令行参数
 
@@ -94,7 +93,7 @@ ctyun_keepalive.exe /p
 
 ### 编译命令 (MSVC x64)
 
-打开\"x64 Native Tools Command Prompt\"，执行：
+<br />
 
 ```batch
 cl /O2 /MD /GS- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8 /GL ctyun_keepalive.c ^
@@ -102,29 +101,16 @@ cl /O2 /MD /GS- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8 /GL ctyun_keepalive.c 
    winhttp.lib ws2_32.lib crypt32.lib advapi32.lib iphlpapi.lib bcrypt.lib ole32.lib windowscodecs.lib user32.lib gdi32.lib
 ```
 
-> **1.2.2 编译优化**: 新增 `/GL`(全程序优化) 和 `/LTCG`(链接时代码生成)，可提升 5-10% 运行性能并减小可执行文件体积。
+<br />
 
 ### 输出到bin目录
 
 ```batch
 mkdir bin 2>nul
-cl /O2 /MD /GS- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8 /GL /Fo\"bin\\ctyun_keepalive.obj\" ctyun_keepalive.c ^
-   /link /SUBSYSTEM:CONSOLE /STACK:131072,131072 /OPT:REF /OPT:ICF /LTCG /OUT:\"bin\\ctyun_keepalive.exe\" ^
+cl /O2 /MD /GS- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8 /GL /Fo"bin\ctyun_keepalive.obj" ctyun_keepalive.c ^
+   /link /SUBSYSTEM:CONSOLE /STACK:131072,131072 /OPT:REF /OPT:ICF /LTCG /OUT:"bin\ctyun_keepalive.exe" ^
    winhttp.lib ws2_32.lib crypt32.lib advapi32.lib iphlpapi.lib bcrypt.lib ole32.lib windowscodecs.lib user32.lib gdi32.lib
 ```
-
-## 性能优化说明
-
-| 优化项                | 说明                                  |
-| ------------------ | ----------------------------------- |
-| Desktop 动态指针       | 证书等字段改为 char*，保活阶段 free() 真正释放物理内存 |
-| DesktopLight 轻量结构  | 状态轮询使用 132 字节轻量结构，减少内存占用            |
-| connect_msg 精确分配  | 按需计算大小，替代固定 12KB 缓冲区                |
-| ws_uri 预构建        | 保活阶段释放 host/port/clink_host        |
-| trim_working_set | 定期将物理内存页归还操作系统                      |
-| 线程栈缩小              | 128KB 栈替代默认 1MB                     |
-| WS缓冲区堆分配           | 保活循环接收缓冲区改为堆分配，避免每次循环栈分配4KB         |
-| 连接延迟优化             | WebSocket连接后等待时间从500ms降至100ms       |
 
 ## 首次使用
 
