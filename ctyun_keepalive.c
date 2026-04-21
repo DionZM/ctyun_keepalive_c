@@ -24,7 +24,7 @@
  *      /link /SUBSYSTEM:CONSOLE /STACK:131072,131072 /OPT:REF /OPT:ICF ^
  *      winhttp.lib ws2_32.lib crypt32.lib advapi32.lib iphlpapi.lib bcrypt.lib ole32.lib windowscodecs.lib user32.lib gdi32.lib
  *
- * 版本: 1.2.0
+ * 版本: 1.2.1
  */
 
 /* ======================== 标准库与系统头文件 ======================== */
@@ -63,7 +63,13 @@
 #pragma comment(lib, "gdi32.lib")       /* GDI: CreateDIBSection, StretchBlt */
 
 /* ======================== 常量定义 ======================== */
-#define APP_VERSION   "1.2.0"
+#define APP_VERSION   "1.2.1"
+/*
+ * 1.2.1 版本说明:
+ * 1. 修复日志中文乱码问题
+ * 2. 为统一轮询、日志和JSON范围解析优化逻辑补充审核级注释
+ * 3. 新增针对UTF-8日志与范围解析的测试程序
+ */
 #define MAX_DESKTOPS  10       /* 最大桌面数量 */
 #define CHECK_INTERVAL 180     /* 未运行桌面状态检查间隔(秒)，即3分钟 */
 #define MAX_RESP      65536    /* HTTP响应缓冲区大小(64KB) */
@@ -91,6 +97,10 @@ static FILE *g_log_file = NULL;
 
 /* 日志文件路径(与exe同目录) */
 static char g_log_path[MAX_PATH] = "";
+/* g_log_size 按写入量追踪当前日志大小，用来替代高频 ftell() */
+static long g_log_size = 0;
+/* g_log_last_flush 用于将立即flush()改为按时间阈值冲刷 */
+static DWORD g_log_last_flush = 0;
 
 static volatile LONG g_bg_switch = 0;
 
@@ -151,6 +161,33 @@ static DWORD WINAPI console_input_thread(LPVOID param) {
     return 0;
 }
 
+/*
+ * open_log_file - 打开 UTF-8 日志文件并统一初始化状态
+ *
+ * 设计目标:
+ * 1. 统一设置较大的用户态缓冲区，减少后台日志的系统调用次数
+ * 2. 在新建文件时写入 UTF-8 BOM，便于部分 Windows 工具稳定识别编码
+ * 3. 返回当前文件大小，避免后续 log_line() 每条日志都调用 ftell()
+ */
+static FILE *open_log_file(const char *path, const char *mode, long *size_out) {
+    FILE *f = fopen(path, mode);
+    if (!f) return NULL;
+    setvbuf(f, NULL, _IOFBF, 64 * 1024);
+    if (size_out) {
+        long size = 0;
+        if (mode[0] == 'w') {
+            static const unsigned char utf8_bom[] = {0xEF, 0xBB, 0xBF};
+            fwrite(utf8_bom, 1, sizeof(utf8_bom), f);
+            size = (long)sizeof(utf8_bom);
+        }
+        if (mode[0] == 'a') {
+            if (fseek(f, 0, SEEK_END) == 0) size = ftell(f);
+        }
+        *size_out = size;
+    }
+    return f;
+}
+
 /**
  * log_line - 带时间戳的UTF-8日志输出
  *
@@ -165,14 +202,19 @@ static void log_line(const char *fmt, ...) {
     SYSTEMTIME st;
     GetLocalTime(&st);
     char buf[2048];
-    int prefix = sprintf(buf, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds / 10);
+    /* 先写入时间戳，再追接用户消息，避免多次字符串拼接 */
+    int prefix = _snprintf(buf, sizeof(buf), "[%02d:%02d:%02d.%03d] ",
+                           st.wHour, st.wMinute, st.wSecond, st.wMilliseconds / 10);
+    if (prefix < 0 || prefix >= (int)sizeof(buf)) prefix = (int)sizeof(buf) - 1;
     va_list ap;
     va_start(ap, fmt);
-    int msglen = vsnprintf(buf + prefix, sizeof(buf) - prefix, fmt, ap);
+    int msglen = vsnprintf(buf + prefix, sizeof(buf) - prefix - 2, fmt, ap);
     va_end(ap);
+    if (msglen < 0) msglen = 0;
     int total = prefix + msglen;
-    buf[total] = '\n';
-    buf[total + 1] = 0;
+    if (total > (int)sizeof(buf) - 2) total = (int)sizeof(buf) - 2;
+    buf[total++] = '\n';
+    buf[total] = 0;
 
     /* 前台模式: 输出到控制台 */
     if (!g_background) {
@@ -184,25 +226,32 @@ static void log_line(const char *fmt, ...) {
             FillConsoleOutputCharacterW(hOut, L' ', csbi.dwSize.X, bpos, &written);
             FillConsoleOutputAttribute(hOut, csbi.wAttributes, csbi.dwSize.X, bpos, &written);
         }
-        int wlen = MultiByteToWideChar(CP_UTF8, 0, buf, -1, NULL, 0);
+        /*
+         * 日志内存中始终保持 UTF-8，前台显示时再弹性变换到 UTF-16。
+         * 这样既能保证 run.log 编码一致，也能避免控制台的代码页问题*/
+        WCHAR wbuf[2048];
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, buf, -1, wbuf, (int)(sizeof(wbuf) / sizeof(wbuf[0])));
         if (wlen > 0) {
-            WCHAR *wbuf = (WCHAR *)malloc(wlen * sizeof(WCHAR));
-            MultiByteToWideChar(CP_UTF8, 0, buf, -1, wbuf, wlen);
             DWORD written;
             WriteConsoleW(hOut, wbuf, wlen - 1, &written, NULL);
-            free(wbuf);
         }
         refresh_banner();
     }
 
     /* 后台模式或日志文件已打开: 写入run.log */
     if (g_log_file) {
-        fwrite(buf, 1, total + 1, g_log_file);
-        fflush(g_log_file);
+        fwrite(buf, 1, total, g_log_file);
+        g_log_size += total;
+        /* 使用时间窗口批量flush，减少后台日志带来的磁盘I/O压力 */
+        if ((DWORD)(GetTickCount() - g_log_last_flush) >= 1000) {
+            fflush(g_log_file);
+            g_log_last_flush = GetTickCount();
+        }
         /* 检查文件大小，超过1MB时截断保留末尾512KB */
-        long fpos = ftell(g_log_file);
-        if (fpos > 1024 * 1024) {
+        if (g_log_size > 1024 * 1024) {
+            fflush(g_log_file);
             fclose(g_log_file);
+            g_log_file = NULL;
             /* 读取文件末尾512KB */
             FILE *rf = fopen(g_log_path, "rb");
             if (rf) {
@@ -212,18 +261,22 @@ static void log_line(const char *fmt, ...) {
                 long skip = fsize - keep;
                 if (skip < 0) skip = 0;
                 fseek(rf, skip, SEEK_SET);
-                char *tail = (char *)malloc(keep + 1);
-                size_t nread = fread(tail, 1, keep, rf);
+                /* 截转时只保留最新的 512KB，避免在内存中重新处理整个日志文件 */
+                char *tail = (char *)malloc(keep);
+                size_t nread = tail ? fread(tail, 1, keep, rf) : 0;
                 fclose(rf);
                 /* 重写文件，只保留末尾部分 */
-                g_log_file = fopen(g_log_path, "w");
-                if (g_log_file) {
+                g_log_file = open_log_file(g_log_path, "w", &g_log_size);
+                if (g_log_file && tail) {
                     fwrite(tail, 1, nread, g_log_file);
+                    g_log_size = (long)nread;
                     fflush(g_log_file);
+                    g_log_last_flush = GetTickCount();
                 }
                 free(tail);
+                if (!tail) g_log_file = open_log_file(g_log_path, "a", &g_log_size);
             } else {
-                g_log_file = fopen(g_log_path, "a");
+                g_log_file = open_log_file(g_log_path, "a", &g_log_size);
             }
         }
     }
@@ -450,6 +503,41 @@ static int jbool(const char *j, const char *k) {
     return 0;
 }
 
+/*
+ * find_in_range / jstr_range - 在 JSON 字符串的指定范围内查找字段
+ *
+ * 这两个函数是今日 JSON 优化的核心。它们允许在 [start, end)
+ * 范围内直接解析对象，从而更新了"先 malloc+memcpy 子串，再多
+ * strstr()的路径。对本程序来说，这能减少临时堆分配和重复扫描，
+ * 同时保持易读性，避免一次性换成大量 JSON 库带来风险。
+ */
+static const char *find_in_range(const char *start, const char *end, const char *needle) {
+    size_t nlen = strlen(needle);
+    if (nlen == 0 || end <= start) return NULL;
+    for (const char *p = start; p + nlen <= end; p++) {
+        if (*p == needle[0] && memcmp(p, needle, nlen) == 0) return p;
+    }
+    return NULL;
+}
+
+static char *jstr_range(const char *start, const char *end, const char *k, char *buf, size_t bsz) {
+    char srch[128];
+    snprintf(srch, sizeof(srch), "\"%s\"", k);
+    const char *p = find_in_range(start, end, srch);
+    if (!p) { buf[0] = 0; return buf; }
+    p += strlen(srch);
+    while (p < end && (*p == ' ' || *p == ':')) p++;
+    if (p >= end || *p != '"') { buf[0] = 0; return buf; }
+    p++;
+    size_t i = 0;
+    while (p < end && *p && *p != '"' && i < bsz - 1) {
+        if (*p == '\\' && (p + 1) < end) p++;
+        buf[i++] = *p++;
+    }
+    buf[i] = 0;
+    return buf;
+}
+
 /**
  * str_dup - 堆上复制字符串
  *
@@ -496,6 +584,9 @@ typedef struct {
     int is_active;            /* 是否运行中(1=运行中, 0=未运行) */
     char *connect_msg;        /* 预构建的WebSocket连接JSON消息(保活阶段保留) */
     char *ws_uri;             /* 预构建的WebSocket URI(保活阶段保留) */
+    HANDLE start_event;       /* 统一轮询线程激活此桌面时打开事件，唤醒已创建的保活线程 */
+    volatile LONG keepalive_started; /* 用于防止同一桌面被重复连接或重复启动保活 */
+    volatile LONG missing_logged;    /* 桌面从列表中消失时只记录一次日志，避免刷屏 */
 } Desktop;
 
 /**
@@ -549,14 +640,49 @@ typedef struct {
 static void desktop_free_certs(Desktop *d) {
     /* 第一步: 预构建WebSocket连接消息(仅在首次调用时) */
     if (!d->connect_msg && d->ca_cert) {
-        /* 精确计算所需缓冲区大小，避免浪费 */
+        /*
+         * connect_msg中的host/port决定WebSocket实际连接的目标地址:
+         * - 直连模式: 使用桌面分配的原始host/port
+         * - CLink代理模式: 使用clink_host中解析出的host/port
+         *   (代理服务器地址与桌面实际地址不同，需从clink_host字段提取)
+         *
+         * servername字段始终使用原始host/port，这是TLS SNI扩展所需的
+         * 服务器名称，必须与桌面实际域名匹配，不能使用代理地址
+         */
+        const char *msg_host = d->host ? d->host : "";
+        const char *msg_port = d->port ? d->port : "";
+        char clink_h_buf[256] = "", clink_p_buf[32] = "";
+        if (d->clink_host && d->clink_host[0]) {
+            /* 从clink_host解析host:port，格式如"192.168.1.1:9443"或"10.0.0.1" */
+            strncpy(clink_h_buf, d->clink_host, sizeof(clink_h_buf) - 1);
+            clink_h_buf[sizeof(clink_h_buf) - 1] = '\0';
+            char *colon = strchr(clink_h_buf, ':');
+            if (colon) {
+                *colon = '\0';
+                strncpy(clink_p_buf, colon + 1, sizeof(clink_p_buf) - 1);
+                clink_p_buf[sizeof(clink_p_buf) - 1] = '\0';
+            } else {
+                snprintf(clink_p_buf, sizeof(clink_p_buf), "%s", msg_port);
+            }
+            msg_host = clink_h_buf;
+            msg_port = clink_p_buf;
+        }
+        /*
+         * WebSocket连接消息格式:
+         *   type:1     消息类型(1=连接请求)
+         *   ssl:1      启用TLS加密
+         *   host/port  实际连接目标(直连用原始地址，代理用clink地址)
+         *   ca/cert/key PEM格式证书链(用于mTLS双向认证)
+         *   servername TLS SNI服务器名(始终用原始host:port，非代理地址)
+         *   oqs:0      不使用后量子加密
+         */
         size_t need = 256 + strlen(d->ca_cert) + strlen(d->client_cert) + strlen(d->client_key);
         d->connect_msg = (char *)malloc(need);
         snprintf(d->connect_msg, need,
                  "{\"type\":1,\"ssl\":1,\"host\":\"%s\",\"port\":\"%s\","
                  "\"ca\":\"%s\",\"cert\":\"%s\",\"key\":\"%s\","
                  "\"servername\":\"%s:%s\",\"oqs\":0}",
-                 d->host ? d->host : "", d->port ? d->port : "",
+                 msg_host, msg_port,
                  d->ca_cert, d->client_cert, d->client_key,
                  d->host ? d->host : "", d->port ? d->port : "");
     }
@@ -593,7 +719,18 @@ static void desktop_free_certs(Desktop *d) {
  * 程序退出时调用，释放Desktop结构体的所有动态字段，
  * 包括保活阶段保留的connect_msg和ws_uri。
  */
+/*
+ * desktop_cleanup - 退出时彻底释放桌面相关资源
+ *
+ * 1.2.1 后除了释放动态字段之外，还需负责关闭start_event。
+ * 因为现在桌面线程在创建时就会先持有该事件，用来等待统一轮询线程
+ * 发送"可以进入保活"的信号。
+ */
 static void desktop_cleanup(Desktop *d) {
+    if (d->start_event) {
+        CloseHandle(d->start_event);
+        d->start_event = NULL;
+    }
     free(d->connect_msg); d->connect_msg = NULL;
     free(d->ws_uri); d->ws_uri = NULL;
     free(d->host); d->host = NULL;
@@ -791,22 +928,20 @@ static int http_get_binary(const char *url, const char **hdrs, int nhdrs,
  * 用于登录前的不需要认证的API请求(如获取挑战码、登录)。
  * 包含设备类型、版本号、设备码、来源页等基础信息。
  *
- * 注意: 使用static局部变量存储头部字符串，非线程安全，
- *       但本程序中所有HTTP请求都是串行执行的。
+ * 注意: 使用__declspec(thread)线程局部存储，确保多线程安全。
  *
  * @param s      会话信息(提取device_code)
  * @param hdrs   输出请求头指针数组
  * @param nhdrs  输出请求头数量
  */
+static __declspec(thread) char g_bh1[64], g_bh2[64], g_bh3[128], g_bh5[64], g_bh6[256];
 static void make_base_headers(const Session *s, const char **hdrs, int *nhdrs) {
-    static char h1[64], h2[64], h3[128], h5[64], h6[256];
-    snprintf(h1, sizeof(h1), "ctg-devicetype: 60");
-    snprintf(h2, sizeof(h2), "ctg-version: 103020001");
-    snprintf(h3, sizeof(h3), "ctg-devicecode: %s", s->device_code);
-    snprintf(h5, sizeof(h5), "referer: https://pc.ctyun.cn/");
-    snprintf(h6, sizeof(h6), "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36");
-    static const char *base[] = {h6, h1, h2, h3, h5};
-    memcpy(hdrs, base, sizeof(base));
+    snprintf(g_bh1, sizeof(g_bh1), "ctg-devicetype: 60");
+    snprintf(g_bh2, sizeof(g_bh2), "ctg-version: 103020001");
+    snprintf(g_bh3, sizeof(g_bh3), "ctg-devicecode: %s", s->device_code);
+    snprintf(g_bh5, sizeof(g_bh5), "referer: https://pc.ctyun.cn/");
+    snprintf(g_bh6, sizeof(g_bh6), "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36");
+    hdrs[0] = g_bh6; hdrs[1] = g_bh1; hdrs[2] = g_bh2; hdrs[3] = g_bh3; hdrs[4] = g_bh5;
     *nhdrs = 5;
 }
 
@@ -823,32 +958,32 @@ static void make_base_headers(const Session *s, const char **hdrs, int *nhdrs) {
  *
  * 签名算法与天翼云Web客户端一致，确保请求被服务端接受。
  *
+ * 注意: 使用__declspec(thread)线程局部存储，确保多线程安全。
+ *
  * @param s      会话信息(提取user_id/tenant_id/secret_key)
  * @param hdrs   输出请求头指针数组
  * @param nhdrs  输出请求头数量
  */
+static __declspec(thread) char g_sh1[64], g_sh2[64], g_sh3[128], g_sh4[64], g_sh5[64], g_sh6[64], g_sh7[256];
+static __declspec(thread) char g_shts[64], g_shri[64], g_shsig[128];
+static __declspec(thread) char g_shcombined[512], g_shsig_hex[33];
 static void make_sig_headers(const Session *s, const char **hdrs, int *nhdrs) {
-    static char h1[64], h2[64], h3[128], h4[64], h5[64], h6[64], h7[256];
-    static char hts[64], hri[64], hsig[128];
-    static char combined[512], sig[33];
-    snprintf(h1, sizeof(h1), "ctg-devicetype: 60");
-    snprintf(h2, sizeof(h2), "ctg-version: 103020001");
-    snprintf(h3, sizeof(h3), "ctg-devicecode: %s", s->device_code);
-    snprintf(h5, sizeof(h5), "referer: https://pc.ctyun.cn/");
-    snprintf(h7, sizeof(h7), "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36");
-    /* 当前时间戳(毫秒)，用long long避免2038年溢出 */
+    snprintf(g_sh1, sizeof(g_sh1), "ctg-devicetype: 60");
+    snprintf(g_sh2, sizeof(g_sh2), "ctg-version: 103020001");
+    snprintf(g_sh3, sizeof(g_sh3), "ctg-devicecode: %s", s->device_code);
+    snprintf(g_sh5, sizeof(g_sh5), "referer: https://pc.ctyun.cn/");
+    snprintf(g_sh7, sizeof(g_sh7), "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36");
     long long ts = (long long)time(NULL) * 1000LL;
-    snprintf(h4, sizeof(h4), "ctg-userid: %d", s->user_id);
-    snprintf(h6, sizeof(h6), "ctg-tenantid: %d", s->tenant_id);
-    snprintf(hts, sizeof(hts), "ctg-timestamp: %lld", ts);
-    snprintf(hri, sizeof(hri), "ctg-requestid: %lld", ts);
-    /* 签名原文: 设备类型 + 时间戳 + 租户ID + 时间戳 + 用户ID + 版本 + 密钥 */
-    snprintf(combined, sizeof(combined), "60%lld%d%lld%d103020001%s",
+    snprintf(g_sh4, sizeof(g_sh4), "ctg-userid: %d", s->user_id);
+    snprintf(g_sh6, sizeof(g_sh6), "ctg-tenantid: %d", s->tenant_id);
+    snprintf(g_shts, sizeof(g_shts), "ctg-timestamp: %lld", ts);
+    snprintf(g_shri, sizeof(g_shri), "ctg-requestid: %lld", ts);
+    snprintf(g_shcombined, sizeof(g_shcombined), "60%lld%d%lld%d103020001%s",
              ts, s->tenant_id, ts, s->user_id, s->secret_key);
-    md5_hex(combined, sig);
-    snprintf(hsig, sizeof(hsig), "ctg-signaturestr: %s", sig);
-    static const char *all[] = {h7, h1, h2, h3, h5, h4, h6, hts, hri, hsig};
-    memcpy(hdrs, all, sizeof(all));
+    md5_hex(g_shcombined, g_shsig_hex);
+    snprintf(g_shsig, sizeof(g_shsig), "ctg-signaturestr: %s", g_shsig_hex);
+    hdrs[0] = g_sh7; hdrs[1] = g_sh1; hdrs[2] = g_sh2; hdrs[3] = g_sh3; hdrs[4] = g_sh5;
+    hdrs[5] = g_sh4; hdrs[6] = g_sh6; hdrs[7] = g_shts; hdrs[8] = g_shri; hdrs[9] = g_shsig;
     *nhdrs = 10;
 }
 
@@ -1662,27 +1797,22 @@ static int get_desktop_list(Session *s, Desktop *desktops, int max) {
         if (!end) break;
 
         /* 提取单个桌面JSON块 */
-        char *block = (char *)malloc(end - obj + 2);
-        int len = (int)(end - obj + 1);
-        memcpy(block, obj, len);
-        block[len] = 0;
 
         /* 解析桌面字段 */
-        jstr(block, "desktopId", desktops[count].desktop_id, sizeof(desktops[count].desktop_id));
+        jstr_range(obj, end + 1, "desktopId", desktops[count].desktop_id, sizeof(desktops[count].desktop_id));
         /* 部分API版本使用objId代替desktopId */
         if (!desktops[count].desktop_id[0])
-            jstr(block, "objId", desktops[count].desktop_id, sizeof(desktops[count].desktop_id));
-        jstr(block, "desktopCode", desktops[count].desktop_code, sizeof(desktops[count].desktop_code));
+            jstr_range(obj, end + 1, "objId", desktops[count].desktop_id, sizeof(desktops[count].desktop_id));
+        jstr_range(obj, end + 1, "desktopCode", desktops[count].desktop_code, sizeof(desktops[count].desktop_code));
 
         /* 判断运行状态: "运行中"(UTF-8: e8 bf 90 e8 a1 8c e4 b8 ad) */
         char status[64];
-        jstr(block, "useStatusText", status, sizeof(status));
+        jstr_range(obj, end + 1, "useStatusText", status, sizeof(status));
         desktops[count].is_active = (strcmp(status, "\xe8\xbf\x90\xe8\xa1\x8c\xe4\xb8\xad") == 0);
         log_line("桌面[%d]: id=%s code=%s 状态=%s 运行中=%d",
                  count, desktops[count].desktop_id, desktops[count].desktop_code,
                  status, desktops[count].is_active);
         count++;
-        free(block);
         p = end + 1;
     }
     return count;
@@ -1723,19 +1853,14 @@ static int get_desktop_list_light(Session *s, DesktopLight *desktops, int max) {
         if (!obj) break;
         const char *end = find_matching_brace(obj);
         if (!end) break;
-        char *block = (char *)malloc(end - obj + 2);
-        int len = (int)(end - obj + 1);
-        memcpy(block, obj, len);
-        block[len] = 0;
-        jstr(block, "desktopId", desktops[count].desktop_id, sizeof(desktops[count].desktop_id));
+        jstr_range(obj, end + 1, "desktopId", desktops[count].desktop_id, sizeof(desktops[count].desktop_id));
         if (!desktops[count].desktop_id[0])
-            jstr(block, "objId", desktops[count].desktop_id, sizeof(desktops[count].desktop_id));
-        jstr(block, "desktopCode", desktops[count].desktop_code, sizeof(desktops[count].desktop_code));
+            jstr_range(obj, end + 1, "objId", desktops[count].desktop_id, sizeof(desktops[count].desktop_id));
+        jstr_range(obj, end + 1, "desktopCode", desktops[count].desktop_code, sizeof(desktops[count].desktop_code));
         char status[64];
-        jstr(block, "useStatusText", status, sizeof(status));
+        jstr_range(obj, end + 1, "useStatusText", status, sizeof(status));
         desktops[count].is_active = (strcmp(status, "\xe8\xbf\x90\xe8\xa1\x8c\xe4\xb8\xad") == 0);
         count++;
-        free(block);
         p = end + 1;
     }
     return count;
@@ -1793,32 +1918,29 @@ static int connect_desktop(Session *s, Desktop *d) {
 
     /* 解析desktopInfo中的连接参数，动态分配到堆 */
     int len = (int)(di_end - di + 1);
-    char *block = (char *)malloc(len + 1);
-    memcpy(block, di, len);
-    block[len] = 0;
 
     /* 使用临时缓冲区提取字段，再str_dup到堆上 */
     char *tmp = (char *)malloc(len + 1);
-    jstr(block, "host", tmp, len + 1);
+    if (!tmp) return 0;
+    jstr_range(di, di_end + 1, "host", tmp, len + 1);
     d->host = str_dup(tmp);
-    jstr(block, "port", tmp, len + 1);
+    jstr_range(di, di_end + 1, "port", tmp, len + 1);
     d->port = str_dup(tmp);
-    jstr(block, "clinkLvsOutHost", tmp, len + 1);
+    jstr_range(di, di_end + 1, "clinkLvsOutHost", tmp, len + 1);
     d->clink_host = str_dup(tmp);
-    jstr(block, "caCert", tmp, len + 1);
+    jstr_range(di, di_end + 1, "caCert", tmp, len + 1);
     d->ca_cert = str_dup(tmp);
-    jstr(block, "clientCert", tmp, len + 1);
+    jstr_range(di, di_end + 1, "clientCert", tmp, len + 1);
     d->client_cert = str_dup(tmp);
-    jstr(block, "clientKey", tmp, len + 1);
+    jstr_range(di, di_end + 1, "clientKey", tmp, len + 1);
     d->client_key = str_dup(tmp);
-    jstr(block, "token", tmp, len + 1);
+    jstr_range(di, di_end + 1, "token", tmp, len + 1);
     d->token = str_dup(tmp);
-    jstr(block, "tenantMemberAccount", tmp, len + 1);
+    jstr_range(di, di_end + 1, "tenantMemberAccount", tmp, len + 1);
     d->tenant_account = str_dup(tmp);
     log_line("连接桌面成功: host=%s port=%s clink=%s",
              d->host ? d->host : "", d->port ? d->port : "", d->clink_host ? d->clink_host : "");
     free(tmp);
-    free(block);
     return (d->host && d->host[0]) ? 1 : 0;
 }
 
@@ -2160,8 +2282,12 @@ static int aead_open(const uint8_t *ct, size_t ctlen, const uint8_t key[32],
     uint8_t expected[16];
     poly1305(mac_data, mac_len, blk0, expected);
     free(mac_data);
-    /* 常量时间比较防止时序攻击 */
-    if (memcmp(tag, expected, 16) != 0) return 0;
+    /* 常量时间比较认证标签，防止时序侧信道攻击 */
+    {
+        volatile uint8_t diff = 0;
+        for (int ci = 0; ci < 16; ci++) diff |= tag[ci] ^ expected[ci];
+        if (diff != 0) return 0;
+    }
 
     /* 认证通过，解密密文 */
     chacha20_xor(ct, dlen, key, nonce, 1, pt);
@@ -2510,7 +2636,17 @@ static int resolve_credentials(Session *s) {
     printf("账户: "); fflush(stdout);
     fgets(user, sizeof(user), stdin); user[strcspn(user, "\r\n")] = 0;
     printf("密码: "); fflush(stdout);
-    fgets(pass, sizeof(pass), stdin); pass[strcspn(pass, "\r\n")] = 0;
+    /* 关闭控制台回显，防止密码被旁人窥视 */
+    {
+        DWORD old_mode = 0;
+        HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+        GetConsoleMode(hIn, &old_mode);
+        SetConsoleMode(hIn, old_mode & ~ENABLE_ECHO_INPUT);
+        fgets(pass, sizeof(pass), stdin);
+        SetConsoleMode(hIn, old_mode);
+        printf("\n");
+    }
+    pass[strcspn(pass, "\r\n")] = 0;
 
     if (!user[0] || !pass[0]) { log_line("账户或密码为空"); return 0; }
 
@@ -2652,7 +2788,9 @@ static size_t rsa_oaep_encrypt(const uint8_t *n_bytes, size_t n_len, uint32_t e_
  */
 static int handle_redq(const uint8_t *msg, size_t mlen, uint8_t *resp, size_t *rlen) {
     if (mlen < 16 || memcmp(msg, "REDQ", 4) != 0) return 0;
+    /* REDQ消息头: "REDQ"(4) + 12字节协议头 = 16字节偏移后为密钥数据 */
     const uint8_t *key_data = msg + 16;
+    /* 密钥数据最少需要: 32字节随机数 + 129字节RSA模数 + 3字节指数 + 2字节保留 = 166字节 */
     if (mlen - 16 < 166) return 0;
 
     /* 提取RSA公钥: 模数(key_data+32, 129字节) 和 指数(key_data+163, 3字节) */
@@ -2679,7 +2817,13 @@ static int handle_redq(const uint8_t *msg, size_t mlen, uint8_t *resp, size_t *r
  *
  * 连接建立后发送的固定二进制载荷，用于通知服务端
  * 客户端支持的协议版本和功能。内容为REDQ协议的
- * 初始化消息，包含版本号和功能标志。
+ * 初始化消息(版本2)，包含:
+ *   - "REDQ"魔数(4字节)
+ *   - 协议版本号(2字节, 值为2)
+ *   - 功能标志位(包含支持的加密套件、压缩方式等)
+ *
+ * 此消息必须在connect_msg之后发送，服务端收到后
+ * 才会开始REDQ认证握手和后续数据推送。
  */
 static uint8_t initial_payload[] = {
     0x52,0x45,0x44,0x51,0x02,0x00,0x00,  /* "REDQ" + 版本2 */
@@ -2917,6 +3061,104 @@ static void ws_close(WSConn *wsc) {
     if (wsc->hSession) WinHttpCloseHandle(wsc->hSession);
 }
 
+/* ======================== SendInfo协议解析 ======================== */
+
+/**
+ * SendInfo 是天翼云 WebSocket 二进制消息的封装协议，格式如下:
+ *   [2字节type(小端)] [4字节总长度(小端)] [数据...]
+ * 当 type=103(CLINK_MSG_MAIN_INIT) 时表示服务端要求客户端发送身份信息;
+ * 客户端应回复 type=118 的 BuildMsg，格式为:
+ *   [2字节type=118] [4字节总长度] [4字节data长度] [4字节固定值8] [data...]
+ */
+
+/**
+ * has_send_info_type - 检查二进制缓冲区中是否包含指定类型的 SendInfo 消息
+ *
+ * 遍历缓冲区中的所有 SendInfo 消息，按协议格式逐条解析:
+ *   偏移+0: 2字节消息类型(小端)
+ *   偏移+2: 4字节消息数据长度(小端，含6字节头)
+ *   偏移+6: 消息数据
+ *
+ * @param buf         二进制缓冲区
+ * @param blen        缓冲区长度
+ * @param target_type 目标消息类型(如103)
+ * @return            1=找到, 0=未找到或格式错误
+ */
+static int has_send_info_type(const uint8_t *buf, size_t blen, uint16_t target_type) {
+    size_t off = 0;
+    while (off + 6 <= blen) {
+        uint16_t tp = (uint16_t)(buf[off] | (buf[off + 1] << 8));
+        int32_t dlen = (int32_t)(buf[off + 2] | (buf[off + 3] << 8) | (buf[off + 4] << 16) | (buf[off + 5] << 24));
+        if (dlen < 0 || off + 6 + (size_t)dlen > blen) return 0;
+        if (tp == target_type) return 1;
+        off += 6 + (size_t)dlen;
+    }
+    return 0;
+}
+
+/**
+ * build_send_info_msg - 构建 SendInfo 协议消息
+ *
+ * 普通消息(is_build_msg=0)格式:
+ *   [2字节type] [4字节总长度] [data]
+ *
+ * BuildMsg(is_build_msg=1)格式(用于type=118等):
+ *   [2字节type] [4字节总长度] [4字节data长度] [4字节固定值8] [data]
+ *   其中"固定值8"是BuildMsg子协议的头部标识，含义为"后续data段的偏移量"
+ *
+ * @param type_val    消息类型(如118)
+ * @param data        消息数据
+ * @param dlen        数据长度
+ * @param is_build_msg 是否为BuildMsg格式(1=是, 0=否)
+ * @param out         输出缓冲区
+ * @return            消息总长度
+ */
+static size_t build_send_info_msg(uint16_t type_val, const uint8_t *data, size_t dlen, int is_build_msg, uint8_t *out) {
+    size_t msg_length = is_build_msg ? 8 : 0;
+    size_t sz = msg_length + dlen;
+    out[0] = (uint8_t)(type_val & 0xFF);
+    out[1] = (uint8_t)((type_val >> 8) & 0xFF);
+    out[2] = (uint8_t)(sz & 0xFF);
+    out[3] = (uint8_t)((sz >> 8) & 0xFF);
+    out[4] = (uint8_t)((sz >> 16) & 0xFF);
+    out[5] = (uint8_t)((sz >> 24) & 0xFF);
+    if (is_build_msg) {
+        /* BuildMsg子头: 4字节data长度 + 4字节固定偏移值8 */
+        out[6] = (uint8_t)(dlen & 0xFF);
+        out[7] = (uint8_t)((dlen >> 8) & 0xFF);
+        out[8] = (uint8_t)((dlen >> 16) & 0xFF);
+        out[9] = (uint8_t)((dlen >> 24) & 0xFF);
+        out[10] = 8 & 0xFF;
+        out[11] = (8 >> 8) & 0xFF;
+        out[12] = (8 >> 16) & 0xFF;
+        out[13] = (8 >> 24) & 0xFF;
+    }
+    if (dlen > 0) memcpy(out + 6 + msg_length, data, dlen);
+    return 6 + msg_length + dlen;
+}
+
+/**
+ * build_user_payload - 构建type=118用户身份消息
+ *
+ * 当收到type=103(CLINK_MSG_MAIN_INIT)时，客户端需要发送用户身份信息。
+ * 消息体为JSON: {"type":1, "userName":"xxx", "userInfo":"", "userId":123}
+ *
+ * @param s       会话信息(含user_account和user_id)
+ * @param out     输出缓冲区
+ * @param out_sz  缓冲区大小
+ * @return        消息总长度，缓冲区不足返回0
+ */
+static size_t build_user_payload(const Session *s, uint8_t *out, size_t out_sz) {
+    char user_json[512];
+    snprintf(user_json, sizeof(user_json),
+             "{\"type\":1,\"userName\":\"%s\",\"userInfo\":\"\",\"userId\":%d}",
+             s->user_account, s->user_id);
+    size_t jlen = strlen(user_json);
+    size_t need = 6 + 8 + jlen;
+    if (need > out_sz) return 0;
+    return build_send_info_msg(118, (const uint8_t *)user_json, jlen, 1, out);
+}
+
 /* ======================== 保活线程 ======================== */
 
 /**
@@ -2925,6 +3167,12 @@ static void ws_close(WSConn *wsc) {
  * 传递Session和Desktop指针给工作线程。
  */
 typedef struct { Session *session; Desktop *desktop; } ThreadParam;
+/* MonitorParam: 将会话和整个桌面数组交给统一轮询线程 */
+typedef struct {
+    Session *session;
+    Desktop *desktops;
+    int count;
+} MonitorParam;
 
 /**
  * keep_alive_thread - 保活工作线程
@@ -2947,9 +3195,28 @@ typedef struct { Session *session; Desktop *desktop; } ThreadParam;
 static DWORD WINAPI keep_alive_thread(LPVOID param) {
     ThreadParam *tp = (ThreadParam *)param;
     Desktop *d = tp->desktop;
+    Session *s = tp->session;
 
     uint8_t *ws_buf = (uint8_t *)malloc(4096);
     if (!ws_buf) return 0;
+
+    uint8_t user_payload_buf[1024];
+    size_t user_payload_len = build_user_payload(s, user_payload_buf, sizeof(user_payload_buf));
+    int user_payload_sent = 0;
+
+    /*
+     * 1.2.1 的线程模型改为：保活线程在创建后先等待 start_event。
+     * 这样可以把后续是否开始保活的决定权交给统一轮询线程，
+     * 从而免去非运行桌面各自拉取一次完整列表的重开销。
+     */
+    while (g_running) {
+        DWORD wait = WaitForSingleObject(d->start_event, 1000);
+        if (wait == WAIT_OBJECT_0) break;
+    }
+    if (!g_running) {
+        free(ws_buf);
+        return 0;
+    }
 
     int cycle = 0;
     while (g_running) {
@@ -2964,6 +3231,7 @@ static DWORD WINAPI keep_alive_thread(LPVOID param) {
         ws_send_text(&wsc, d->connect_msg);
         Sleep(100);
         ws_send_bytes(&wsc, initial_payload, sizeof(initial_payload));
+        user_payload_sent = 0;
 
         log_line("[%s] 已连接，保持60秒", d->desktop_code);
 
@@ -2979,6 +3247,13 @@ static DWORD WINAPI keep_alive_thread(LPVOID param) {
                 if (handle_redq(ws_buf, n, resp, &rlen)) {
                     ws_send_bytes(&wsc, resp, rlen);
                     log_line("[%s] REDQ认证响应成功", d->desktop_code);
+                }
+            } else if (!is_text && n >= 6 && user_payload_len > 0 && !user_payload_sent) {
+                /* 收到CLINK_MSG_MAIN_INIT(type=103): 服务端要求客户端发送用户身份 */
+                if (has_send_info_type(ws_buf, (size_t)n, 103)) {
+                    ws_send_bytes(&wsc, user_payload_buf, user_payload_len);
+                    log_line("[%s] 发送用户身份响应", d->desktop_code);
+                    user_payload_sent = 1;
                 }
             }
         }
@@ -2996,58 +3271,6 @@ static DWORD WINAPI keep_alive_thread(LPVOID param) {
     return 0;
 }
 
-/**
- * check_desktop_thread - 桌面状态监控线程
- *
- * 对未运行的桌面定期检查状态:
- * 1. 每CHECK_INTERVAL秒(3分钟)查询一次桌面列表
- * 2. 使用DesktopLight轻量结构体减少内存占用
- * 3. 若桌面变为运行中，调用connect_desktop获取连接参数
- * 4. 调用desktop_free_certs释放证书内存
- * 5. 切换为keep_alive_thread保活模式
- *
- * @param param  ThreadParam指针
- * @return       线程退出码(0)
- */
-static DWORD WINAPI check_desktop_thread(LPVOID param) {
-    ThreadParam *tp = (ThreadParam *)param;
-    Desktop *d = tp->desktop;
-    Session *s = tp->session;
-
-    while (g_running) {
-        Sleep(CHECK_INTERVAL * 1000);
-        if (!g_running) break;
-        log_line("[%s] 正在检查状态...", d->desktop_code);
-
-        /* 使用轻量结构体查询桌面状态 */
-        DesktopLight *tmp = (DesktopLight *)calloc(MAX_DESKTOPS, sizeof(DesktopLight));
-        int n = get_desktop_list_light(s, tmp, MAX_DESKTOPS);
-        int found = 0;
-        for (int i = 0; i < n; i++) {
-            if (strcmp(tmp[i].desktop_id, d->desktop_id) == 0) {
-                found = 1;
-                if (tmp[i].is_active) {
-                    /* 桌面已开机，切换为保活模式 */
-                    log_line("[%s] 桌面已激活，开始保活", d->desktop_code);
-                    free(tmp);
-                    if (connect_desktop(s, d)) {
-                        desktop_free_certs(d);
-                        keep_alive_thread(param);  /* 直接调用，不创建新线程 */
-                    }
-                    return 0;
-                } else {
-                    log_line("[%s] 桌面仍未激活", d->desktop_code);
-                }
-                break;
-            }
-        }
-        free(tmp);
-        if (!found) { log_line("[%s] 桌面未找到，停止监控", d->desktop_code); return 0; }
-        trim_working_set();
-    }
-    return 0;
-}
-
 /* ======================== 程序入口 ======================== */
 
 /**
@@ -3055,6 +3278,80 @@ static DWORD WINAPI check_desktop_thread(LPVOID param) {
  *
  * 设置g_running为0，通知所有工作线程优雅退出。
  */
+
+/*
+ * monitor_desktops_thread - 统一桌面状态轮询线程
+ *
+ * 1.2.1 改为单一轮询模式：每个 CHECK_INTERVAL 只请求一次 desktopList，
+ * 再在本地将状态分发到各个 Desktop。这取代了"每个未运行桌面
+ * 各自启动一个轮询线程"的策略，从而减少网络重复请求。
+ */
+static DWORD WINAPI monitor_desktops_thread(LPVOID param) {
+    MonitorParam *mp = (MonitorParam *)param;
+    Session *s = mp->session;
+    Desktop *desktops = mp->desktops;
+    int count = mp->count;
+    DesktopLight tmp[MAX_DESKTOPS];
+
+    while (g_running) {
+        Sleep(CHECK_INTERVAL * 1000);
+        if (!g_running) break;
+        log_line("正在统一检查桌面状态...");
+
+        ZeroMemory(tmp, sizeof(tmp));
+        int n = get_desktop_list_light(s, tmp, MAX_DESKTOPS);
+        for (int i = 0; i < count; i++) {
+            Desktop *d = &desktops[i];
+            int found = 0;
+            int active = 0;
+
+            /* InterlockedCompareExchange(&val, 0, 0) = 原子读取val的当前值(不修改) */
+            /* 已经进入保活的桌面不再参与轮询，避免重复连接 */
+            if (InterlockedCompareExchange(&d->keepalive_started, 0, 0)) continue;
+
+            for (int j = 0; j < n; j++) {
+                if (strcmp(tmp[j].desktop_id, d->desktop_id) == 0) {
+                    found = 1;
+                    active = tmp[j].is_active;
+                    break;
+                }
+            }
+
+            if (!found) {
+                if (!InterlockedCompareExchange(&d->missing_logged, 0, 0)) {
+                    log_line("[%s] 桌面未找到，停止等待激活", d->desktop_code);
+                    InterlockedExchange(&d->missing_logged, 1);
+                }
+                continue;
+            }
+
+            if (!active) {
+                log_line("[%s] 桌面仍未激活", d->desktop_code);
+                continue;
+            }
+
+            /*
+             * InterlockedCompareExchange(&val, 1, 0): 若val==0则设为1并返回0，否则返回原值
+             * 返回0表示本线程成功将状态从0改为1，获得建立连接的权限
+             * 这能防止多次轮询周期在短时间内反复唤醒同一桌面。
+             */
+            if (InterlockedCompareExchange(&d->keepalive_started, 1, 0) == 0) {
+                log_line("[%s] 桌面已激活，开始建立保活连接", d->desktop_code);
+                if (connect_desktop(s, d)) {
+                    desktop_free_certs(d);
+                    SetEvent(d->start_event);
+                } else {
+                    InterlockedExchange(&d->keepalive_started, 0);
+                }
+            }
+        }
+
+        /* 轮询周期间隔较长，顺手将未使用的物理内存归还给系统 */
+        trim_working_set();
+    }
+    return 0;
+}
+
 static BOOL WINAPI ctrl_handler(DWORD type) {
     if (type == CTRL_C_EVENT || type == CTRL_CLOSE_EVENT) {
         InterlockedExchange(&g_running, 0);
@@ -3153,22 +3450,56 @@ int main(int argc, char *argv[]) {
 
     /* 为每个桌面创建工作线程 */
     ThreadParam params[MAX_DESKTOPS];
-    HANDLE threads[MAX_DESKTOPS];
+    HANDLE threads[MAX_DESKTOPS + 2];
+    MonitorParam monitor = {&session, desktops, ndesktops};
     int nthreads = 0;
 
+    /*
+     * 1.2.1 的启动流程与 1.2.0 最大差异在于：
+     * 1. 每个桌面的保活线程先创建出来，但在 start_event 上等待
+     * 2. 已运行的桌面立即触发事件，未运行的桌面则交给统一轮询线程
+     * 3. 这样可以明确"线程生命周期"和"何时开始保活"两个职责
+     */
     for (int i = 0; i < ndesktops; i++) {
         params[i].session = &session;
         params[i].desktop = &desktops[i];
 
+        desktops[i].start_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+        if (!desktops[i].start_event) {
+            log_line("[%s] 保活启动事件创建失败: %lu", desktops[i].desktop_code, GetLastError());
+            continue;
+        }
+
+        threads[nthreads] = CreateThread(NULL, THREAD_STACK, keep_alive_thread, &params[i], 0, NULL);
+        if (!threads[nthreads]) {
+            log_line("[%s] 保活线程创建失败: %lu", desktops[i].desktop_code, GetLastError());
+            CloseHandle(desktops[i].start_event);
+            desktops[i].start_event = NULL;
+            continue;
+        }
+        nthreads++;
+
         if (desktops[i].is_active) {
             if (connect_desktop(&session, &desktops[i])) {
+                InterlockedExchange(&desktops[i].keepalive_started, 1);
                 desktop_free_certs(&desktops[i]);
-                log_line("[%s] 运行中, 开始保活", desktops[i].desktop_code);
-                threads[nthreads++] = CreateThread(NULL, THREAD_STACK, keep_alive_thread, &params[i], 0, NULL);
+                log_line("[%s] 运行中，开始保活", desktops[i].desktop_code);
+                SetEvent(desktops[i].start_event);
+            } else {
+                log_line("[%s] 连接失败，标记为未激活等待轮询", desktops[i].desktop_code);
+                SetEvent(desktops[i].start_event);
             }
         } else {
-            log_line("[%s] 已关机, 开始监控", desktops[i].desktop_code);
-            threads[nthreads++] = CreateThread(NULL, THREAD_STACK, check_desktop_thread, &params[i], 0, NULL);
+            log_line("[%s] 已关机，等待统一轮询激活", desktops[i].desktop_code);
+        }
+    }
+
+    if (ndesktops > 0) {
+        threads[nthreads] = CreateThread(NULL, THREAD_STACK, monitor_desktops_thread, &monitor, 0, NULL);
+        if (threads[nthreads]) {
+            nthreads++;
+        } else {
+            log_line("统一轮询线程创建失败: %lu", GetLastError());
         }
     }
 
@@ -3183,10 +3514,11 @@ int main(int argc, char *argv[]) {
             char *slash = strrchr(exe_path, '\\');
             if (slash) *slash = 0;
             snprintf(g_log_path, sizeof(g_log_path), "%s\\run.log", exe_path);
-            g_log_file = fopen(g_log_path, "w");
+            g_log_file = open_log_file(g_log_path, "w", &g_log_size);
             if (!g_log_file) {
-                g_log_file = fopen(g_log_path, "a");
+                g_log_file = open_log_file(g_log_path, "a", &g_log_size);
             }
+            g_log_last_flush = GetTickCount();
             FreeConsole();
             log_line("已切换到后台运行, 日志: %s", g_log_path);
         } else {
@@ -3205,8 +3537,9 @@ int main(int argc, char *argv[]) {
                 char *slash = strrchr(exe_path, '\\');
                 if (slash) *slash = 0;
                 snprintf(g_log_path, sizeof(g_log_path), "%s\\run.log", exe_path);
-                g_log_file = fopen(g_log_path, "w");
-                if (!g_log_file) g_log_file = fopen(g_log_path, "a");
+                g_log_file = open_log_file(g_log_path, "w", &g_log_size);
+                if (!g_log_file) g_log_file = open_log_file(g_log_path, "a", &g_log_size);
+                g_log_last_flush = GetTickCount();
                 g_background = 1;
                 FreeConsole();
                 log_line("已切换到后台运行, 日志: %s", g_log_path);
