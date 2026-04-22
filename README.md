@@ -72,9 +72,15 @@ ctyun_keepalive.exe /b
 
 ## 隐私说明
 
-第一次成功登录后，程序会将用户名、密码等相关信息加密保存到 `config.json` 文件中。`config.json` 中的数据经过 ChaCha20-Poly1305 AEAD 加密，并非明文存储，但由于加密算法不是不对称的强加密算法，用户仍需保护好自己的 `config.json` 文件，避免密码泄露。
+第一次成功登录后，程序会将用户名、密码、设备码等信息加密保存到 `config.json` 文件中。`config.json` 中的数据采用**三层加密**保护，并非明文存储：
 
-如果不想程序保存用户名/密码信息，请使用 `/privacy` 或 `/p` 参数启用隐私模式：
+1. **外层：Windows DPAPI** — 绑定本机，利用Windows数据保护API自动管理密钥，同一台机器才能解密
+2. **内层：ChaCha20-Poly1305 AEAD** — 绑定本机硬件指纹，即使DPAPI被绕过仍需硬件匹配
+3. **密钥派生：PBKDF2-HMAC-SHA256** — 100,000次迭代，暴力破解成本极高
+
+加密流程：`明文 → ChaCha20-Poly1305(硬件指纹绑定) → DPAPI(本机绑定) → Base64 → config.json`
+
+尽管采用了多层加密，用户仍需保护好自己的 `config.json` 文件，避免在不受信任的环境中使用。如果不想程序保存用户名/密码信息，请使用 `/privacy` 或 `/p` 参数启用隐私模式：
 
 ```bash
 ctyun_keepalive.exe /privacy

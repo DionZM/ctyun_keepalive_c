@@ -70,14 +70,13 @@
 #pragma comment(lib, "psapi.lib")       /* Process Status API: 内存信息 */
 
 /* ======================== 常量定义 ======================== */
-#define APP_VERSION   "1.3.1"
+#define APP_VERSION   "1.3.2"
 /*
- * 1.3.1 版本说明:
- * 1. 修复: 移除UuidCreateSequential，改用GetAdaptersInfo获取稳定MAC地址
- *    - UuidCreateSequential在VPN/虚拟网卡环境下返回不稳定MAC，重启后变化
- *    - 导致DPAPI解密失败，配置无法恢复
- * 2. 修复: DPAPI恢复使用CRYPTPROTECT_LOCAL_MACHINE，确保重启后可解密
- * 3. 保留1.3.0的所有其他修复
+ * 1.3.2 版本说明:
+ * 1. 修复: 连接桌面成功提示增加桌面编号前缀
+ * 2. 修复: 密码输入回显*号，方便用户确认输入长度
+ * 3. 修复: 去掉内存trim提示，减少日志噪音
+ * 4. 文档: 更新README隐私说明，反映三层加密架构
  */
 #define MAX_DESKTOPS  10       /* 最大桌面数量 */
 #define CHECK_INTERVAL 180     /* 未运行桌面状态检查间隔(秒)，即3分钟 */
@@ -324,9 +323,6 @@ static void trim_working_set(int force) {
             HANDLE hProcess = GetCurrentProcess();
             if (GetProcessMemoryInfo(hProcess, &pmc, sizeof(pmc))) {
                 g_last_trim_memory_kb = pmc.WorkingSetSize / 1024;
-                log_line("内存智能trim: 从%lluKB降至%lluKB", 
-                        (unsigned long long)current_memory_kb, 
-                        (unsigned long long)g_last_trim_memory_kb);
             }
         }
     }
@@ -2239,7 +2235,8 @@ static int connect_desktop(Session *s, Desktop *d) {
     d->token = str_dup(tmp);
     jstr_range(di, di_end + 1, "tenantMemberAccount", tmp, len + 1);
     d->tenant_account = str_dup(tmp);
-    log_line("连接桌面成功: host=%s port=%s clink=%s",
+    log_line("[%s] 连接桌面成功: host=%s port=%s clink=%s",
+             d->desktop_code,
              d->host ? d->host : "", d->port ? d->port : "", d->clink_host ? d->clink_host : "");
     free(tmp);
     return (d->host && d->host[0]) ? 1 : 0;
@@ -3099,17 +3096,23 @@ static int resolve_credentials(Session *s) {
     printf("账户: "); fflush(stdout);
     fgets(user, sizeof(user), stdin); user[strcspn(user, "\r\n")] = 0;
     printf("密码: "); fflush(stdout);
-    /* 关闭控制台回显，防止密码被旁人窥视 */
     {
         DWORD old_mode = 0;
         HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
         GetConsoleMode(hIn, &old_mode);
         SetConsoleMode(hIn, old_mode & ~ENABLE_ECHO_INPUT);
-        fgets(pass, sizeof(pass), stdin);
+        int ch;
+        int pi = 0;
+        while ((ch = fgetc(stdin)) != EOF && ch != '\n' && ch != '\r') {
+            if (pi < (int)sizeof(pass) - 2) {
+                pass[pi++] = (char)ch;
+                putchar('*');
+            }
+        }
+        pass[pi] = 0;
         SetConsoleMode(hIn, old_mode);
         printf("\n");
     }
-    pass[strcspn(pass, "\r\n")] = 0;
 
     if (!user[0] || !pass[0]) { log_line("账户或密码为空"); return 0; }
 
