@@ -3979,6 +3979,8 @@ int main(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "/background") == 0 || strcmp(argv[i], "/b") == 0) {
             g_bg_switch = 1;
+        } else if (strcmp(argv[i], "/__bg") == 0) {
+            g_background = 1;
         } else if (strcmp(argv[i], "/privacy") == 0 || strcmp(argv[i], "/p") == 0) {
             g_privacy = 1;
         } else if (strcmp(argv[i], "/random") == 0 || strcmp(argv[i], "/r") == 0) {
@@ -4120,23 +4122,29 @@ int main(int argc, char *argv[]) {
                 GetModuleFileNameA(NULL, exe_path, MAX_PATH);
                 char *slash = strrchr(exe_path, '\\');
                 if (slash) *slash = 0;
-                snprintf(g_log_path, sizeof(g_log_path), "%s\\run.log", exe_path);
-                g_log_file = open_log_file(g_log_path, "w", &g_log_size);
-                if (!g_log_file) g_log_file = open_log_file(g_log_path, "a", &g_log_size);
-                g_log_last_flush = GetTickCount();
-                log_line("已转入后台运行, 日志: %s", g_log_path);
+                char log_path[MAX_PATH];
+                snprintf(log_path, sizeof(log_path), "%s\\run.log", exe_path);
+
+                log_line("已转入后台运行, 日志: %s", log_path);
                 log_line("本窗口将在5秒后自动关闭...");
-                fflush(g_log_file);
                 Sleep(5000);
-                g_background = 1;
-                FreeConsole();
-                if (hInputThread) {
-                    WaitForSingleObject(hInputThread, 2000);
-                    CloseHandle(hInputThread);
-                    hInputThread = NULL;
+
+                GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+
+                char cmd_line[1024];
+                snprintf(cmd_line, sizeof(cmd_line), "\"%s\" /__bg", exe_path);
+                if (g_privacy) strcat(cmd_line, " /p");
+                if (g_random) strcat(cmd_line, " /r");
+
+                STARTUPINFOA si = { sizeof(si) };
+                PROCESS_INFORMATION pi = {0};
+                if (CreateProcessA(NULL, cmd_line, NULL, NULL, FALSE,
+                                   DETACHED_PROCESS, NULL, NULL, &si, &pi)) {
+                    CloseHandle(pi.hProcess);
+                    CloseHandle(pi.hThread);
                 }
-                WaitForMultipleObjects(nthreads, threads, TRUE, INFINITE);
-                break;
+
+                ExitProcess(0);
             }
         }
 
