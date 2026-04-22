@@ -11,13 +11,6 @@
  *   - OCR连接失败/返回错误/连续3次验证失败时触发手工输入模式
  *   - 手工输入连续3次失败输出"验证码识别错误"并退出程序
  *
- * 内存优化:
- *   - Desktop结构体使用动态指针代替固定数组，保活阶段释放证书等大块内存
- *   - 使用DesktopLight轻量结构体进行状态轮询，减少栈/堆占用
- *   - 定期调用trim_working_set()将物理内存页归还操作系统
- *   - connect_msg按需精确分配，替代固定12KB缓冲区
- *   - 预构建ws_uri，保活阶段释放host/port/clink_host等连接参数
- *   - WebSocket保活循环使用堆分配缓冲区，避免每次循环栈分配
  *
  * 编译 (MSVC x64):
  *   cl /O2 /MD /GS- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8 /GL ctyun_keepalive.c ^
@@ -29,8 +22,7 @@
  *   /LTCG - 链接时代码生成(Link-Time Code Generation)，与/GL配合使用获得最佳性能
  *   相比1.2.1及之前版本，可提升5-10%运行性能，减小可执行文件体积
  *
- * 版本: 1.3.0
- ga/
+ */
 
 /* ======================== 标准库与系统头文件 ======================== */
 #include <stdio.h>
@@ -4132,9 +4124,12 @@ int main(int argc, char *argv[]) {
                 g_log_file = open_log_file(g_log_path, "w", &g_log_size);
                 if (!g_log_file) g_log_file = open_log_file(g_log_path, "a", &g_log_size);
                 g_log_last_flush = GetTickCount();
+                log_line("已转入后台运行, 日志: %s", g_log_path);
+                log_line("本窗口将在5秒后自动关闭...");
+                fflush(g_log_file);
+                Sleep(5000);
                 g_background = 1;
                 FreeConsole();
-                log_line("已切换到后台运行, 日志: %s", g_log_path);
                 if (hInputThread) {
                     WaitForSingleObject(hInputThread, 2000);
                     CloseHandle(hInputThread);
