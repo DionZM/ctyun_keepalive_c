@@ -4144,6 +4144,15 @@ int main(int argc, char *argv[]) {
                     CloseHandle(pi.hThread);
                 }
 
+                HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+                CONSOLE_SCREEN_BUFFER_INFO csbi;
+                if (GetConsoleScreenBufferInfo(hOut, &csbi)) {
+                    COORD pos = {0, csbi.srWindow.Bottom};
+                    DWORD written;
+                    FillConsoleOutputCharacterW(hOut, L' ', csbi.dwSize.X, pos, &written);
+                    FillConsoleOutputAttribute(hOut, csbi.wAttributes, csbi.dwSize.X, pos, &written);
+                }
+
                 ExitProcess(0);
             }
         }
