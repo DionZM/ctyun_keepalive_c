@@ -3904,7 +3904,7 @@ static void usage(const char *exe) {
 int main(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "/background") == 0 || strcmp(argv[i], "/b") == 0) {
-            g_background = 1;
+            g_bg_switch = 1;
         } else if (strcmp(argv[i], "/privacy") == 0 || strcmp(argv[i], "/p") == 0) {
             g_privacy = 1;
         } else if (strcmp(argv[i], "/random") == 0 || strcmp(argv[i], "/r") == 0) {
