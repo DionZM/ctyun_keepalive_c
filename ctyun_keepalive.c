@@ -1486,21 +1486,6 @@ static int try_captcha_ocr(const Session *s, const char *user,
     return 2;
 }
 
-/**
- * read_captcha_manual - 显示验证码窗口并读取手工输入
- *
- * 封装手工输入验证码的完整流程:
- * 1. 显示验证码图片窗口
- * 2. 提示用户手工输入
- * 3. 读取用户输入
- * 4. 关闭验证码窗口
- *
- * @param img_data  验证码图片数据
- * @param img_len   图片数据长度
- * @param out       输出缓冲区
- * @param out_sz    缓冲区大小
- * @return          1=成功读取非空输入, 0=读取失败或为空
- */
 static int read_captcha_manual(const uint8_t *img_data, int img_len, char *out, size_t out_sz) {
     if (img_data && img_len > 0) {
         show_captcha_window(img_data, img_len);
@@ -1513,38 +1498,6 @@ static int read_captcha_manual(const uint8_t *img_data, int img_len, char *out, 
 
 /* ======================== 登录流程 ======================== */
 
-/**
- * do_login - 执行天翼云电脑登录
- *
- * 登录流程:
- * 1. 调用genChallengeData获取挑战码(challengeId + challengeCode)
- * 2. 下载验证码图片并优先OCR识别
- * 3. OCR失败或连续3次自动识别验证失败时，弹出窗口手工输入
- * 4. 计算密码哈希: SHA256(密码+challengeCode) 和 SHA256(SHA256(密码)+challengeCode)
- * 5. URL编码challengeId和deviceCode
- * 6. 构建登录请求体并发送
- * 7. 解析响应获取secretKey/userId/tenantId
- *
- * 手工输入验证码时，连续3次失败则输出"验证码识别错误"并退出程序。
- *
- * @param s     会话信息(输出secretKey/userId/tenantId)
- * @param user  用户名
- * @param pwd   原始密码
- * @return      1=登录成功, 0=登录失败(不返回: 手工3次失败直接退出)
- */
-/**
- * do_login_send - 发送登录请求并解析响应
- *
- * @param s         会话信息
- * @param user      用户名
- * @param final_sha 密码哈希1
- * @param sha2_pwd  密码哈希2
- * @param cid       挑战码ID
- * @param captcha   验证码
- * @param resp      响应缓冲区
- * @param resp_sz   缓冲区大小
- * @return          1=登录成功, 0=登录失败(验证码错误), -1=用户名密码错误, -2=请求失败
- */
 static int do_login_send(Session *s, const char *user, const char *final_sha, const char *sha2_pwd,
                          const char *cid, const char *captcha, char *resp, size_t resp_sz) {
     char enc_cid[512], enc_dc[512];
@@ -1622,11 +1575,11 @@ static int do_login_send(Session *s, const char *user, const char *final_sha, co
 }
 
 static int do_login(Session *s, const char *user, const char *pwd) {
-    int auto_fail_count = 0;
     uint8_t *img_data = NULL;
     int img_len = 0;
+    int auto_fail_count = 0;
 
-    for (int attempt = 1; attempt <= 3; attempt++) {
+    for (int attempt = 1; attempt <= 6; attempt++) {
         char resp[MAX_RESP];
 
         if (api_post_noauth(s, "https://desk.ctyun.cn:8810/api/auth/client/genChallengeData",
@@ -1662,74 +1615,50 @@ static int do_login(Session *s, const char *user, const char *pwd) {
         }
 
         char captcha[64] = "";
-        int use_manual = 0;
+        int is_manual = (attempt > 3) || (auto_fail_count >= 3);
 
-        int ocr_result = try_captcha_ocr(s, user, captcha, sizeof(captcha), &img_data, &img_len);
+        if (!is_manual) {
+            int ocr_result = try_captcha_ocr(s, user, captcha, sizeof(captcha), &img_data, &img_len);
+            if (ocr_result < 2) {
+                is_manual = 1;
+                auto_fail_count = 3;
+            }
+        }
 
-        if (ocr_result >= 2) {
-            int result = do_login_send(s, user, final_sha, sha2_pwd, cid, captcha, resp, sizeof(resp));
-            if (result == 1) {
-                log_line("登录成功: userId=%d, tenantId=%d, bondedDevice=%d", s->user_id, s->tenant_id, s->bonded_device);
-                if (img_data) free(img_data);
-                return 1;
-            }
-            if (result == -1) {
-                if (img_data) free(img_data);
-                return 0;
-            }
-            auto_fail_count++;
-            if (auto_fail_count < 3) {
-                if (img_data) { free(img_data); img_data = NULL; }
+        if (is_manual) {
+            if (!read_captcha_manual(img_data, img_len, captcha, sizeof(captcha))) {
                 continue;
             }
-            use_manual = 1;
-        } else {
-            use_manual = 1;
         }
 
-        if (use_manual) {
-            log_line("验证码自动识别失败，切换手工输入模式");
-            int manual_fail = 0;
-            while (manual_fail < 3) {
-                if (!read_captcha_manual(img_data, img_len, captcha, sizeof(captcha))) {
-                    log_line("手工输入为空");
-                    manual_fail++;
-                    continue;
-                }
-
-                int result = do_login_send(s, user, final_sha, sha2_pwd, cid, captcha, resp, sizeof(resp));
-                if (result == 1) {
-                    log_line("登录成功: userId=%d, tenantId=%d, bondedDevice=%d", s->user_id, s->tenant_id, s->bonded_device);
-                    if (img_data) free(img_data);
-                    return 1;
-                }
-                if (result == -1) {
-                    if (img_data) free(img_data);
-                    return 0;
-                }
-                manual_fail++;
-            }
+        int result = do_login_send(s, user, final_sha, sha2_pwd, cid, captcha, resp, sizeof(resp));
+        if (result == 1) {
+            log_line("登录成功: userId=%d, tenantId=%d, bondedDevice=%d", s->user_id, s->tenant_id, s->bonded_device);
             if (img_data) free(img_data);
-            log_line("验证码识别错误");
-            InterlockedExchange(&g_running, 0);
+            return 1;
+        }
+        if (result == -1) {
+            if (img_data) free(img_data);
             return 0;
         }
+
+        if (!is_manual) {
+            auto_fail_count++;
+            if (auto_fail_count < 3 && img_data) {
+                free(img_data);
+                img_data = NULL;
+            }
+        }
     }
-    log_line("登录失败，已重试3次");
+
     if (img_data) free(img_data);
+    log_line("验证码识别错误");
+    InterlockedExchange(&g_running, 0);
     return 0;
 }
 
 /* ======================== 短信验证码与设备绑定 ======================== */
 
-/**
- * send_sms_request - 发送短信验证码请求
- *
- * @param s       会话信息
- * @param phone   手机号
- * @param captcha 图形验证码
- * @return        1=成功发送, 0=发送失败(验证码错误), -1=请求失败
- */
 static int send_sms_request(const Session *s, const char *phone, const char *captcha) {
     char url[512];
     snprintf(url, sizeof(url),
@@ -1749,58 +1678,47 @@ static int send_sms_request(const Session *s, const char *phone, const char *cap
 }
 
 static int send_sms_code(const Session *s, const char *phone) {
-    int auto_fail_count = 0;
     uint8_t *img_data = NULL;
     int img_len = 0;
+    int auto_fail_count = 0;
 
-    for (int i = 0; i < 3; i++) {
+    for (int attempt = 1; attempt <= 6; attempt++) {
         char captcha[64] = "";
-        int use_manual = 0;
+        int is_manual = (attempt > 3) || (auto_fail_count >= 3);
 
-        int ocr_result = try_captcha_ocr(s, NULL, captcha, sizeof(captcha), &img_data, &img_len);
-
-        if (ocr_result >= 2) {
-            int result = send_sms_request(s, phone, captcha);
-            if (result == 1) {
-                log_line("短信验证码已发送至 %s", phone);
-                if (img_data) free(img_data);
-                return 1;
+        if (!is_manual) {
+            int ocr_result = try_captcha_ocr(s, NULL, captcha, sizeof(captcha), &img_data, &img_len);
+            if (ocr_result < 2) {
+                is_manual = 1;
+                auto_fail_count = 3;
             }
-            auto_fail_count++;
-            if (auto_fail_count < 3) {
-                if (img_data) { free(img_data); img_data = NULL; }
+        }
+
+        if (is_manual) {
+            if (!read_captcha_manual(img_data, img_len, captcha, sizeof(captcha))) {
                 continue;
             }
-            use_manual = 1;
-        } else {
-            use_manual = 1;
         }
 
-        if (use_manual) {
-            log_line("短信验证码自动识别失败，切换手工输入模式");
-            int manual_fail = 0;
-            while (manual_fail < 3) {
-                if (!read_captcha_manual(img_data, img_len, captcha, sizeof(captcha))) {
-                    log_line("手工输入为空");
-                    manual_fail++;
-                    continue;
-                }
-
-                int result = send_sms_request(s, phone, captcha);
-                if (result == 1) {
-                    log_line("短信验证码已发送至 %s", phone);
-                    if (img_data) free(img_data);
-                    return 1;
-                }
-                manual_fail++;
-            }
+        int result = send_sms_request(s, phone, captcha);
+        if (result == 1) {
+            log_line("短信验证码已发送至 %s", phone);
             if (img_data) free(img_data);
-            log_line("验证码识别错误");
-            InterlockedExchange(&g_running, 0);
-            return 0;
+            return 1;
+        }
+
+        if (!is_manual) {
+            auto_fail_count++;
+            if (auto_fail_count < 3 && img_data) {
+                free(img_data);
+                img_data = NULL;
+            }
         }
     }
+
     if (img_data) free(img_data);
+    log_line("验证码识别错误");
+    InterlockedExchange(&g_running, 0);
     return 0;
 }
 
