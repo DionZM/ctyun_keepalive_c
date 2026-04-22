@@ -1486,6 +1486,31 @@ static int try_captcha_ocr(const Session *s, const char *user,
     return 2;
 }
 
+/**
+ * read_captcha_manual - 显示验证码窗口并读取手工输入
+ *
+ * 封装手工输入验证码的完整流程:
+ * 1. 显示验证码图片窗口
+ * 2. 提示用户手工输入
+ * 3. 读取用户输入
+ * 4. 关闭验证码窗口
+ *
+ * @param img_data  验证码图片数据
+ * @param img_len   图片数据长度
+ * @param out       输出缓冲区
+ * @param out_sz    缓冲区大小
+ * @return          1=成功读取非空输入, 0=读取失败或为空
+ */
+static int read_captcha_manual(const uint8_t *img_data, int img_len, char *out, size_t out_sz) {
+    if (img_data && img_len > 0) {
+        show_captcha_window(img_data, img_len);
+    }
+    out[0] = 0;
+    int ok = read_manual_captcha(out, out_sz);
+    close_captcha_window();
+    return ok;
+}
+
 /* ======================== 登录流程 ======================== */
 
 /**
@@ -1507,8 +1532,100 @@ static int try_captcha_ocr(const Session *s, const char *user,
  * @param pwd   原始密码
  * @return      1=登录成功, 0=登录失败(不返回: 手工3次失败直接退出)
  */
+/**
+ * do_login_send - 发送登录请求并解析响应
+ *
+ * @param s         会话信息
+ * @param user      用户名
+ * @param final_sha 密码哈希1
+ * @param sha2_pwd  密码哈希2
+ * @param cid       挑战码ID
+ * @param captcha   验证码
+ * @param resp      响应缓冲区
+ * @param resp_sz   缓冲区大小
+ * @return          1=登录成功, 0=登录失败(验证码错误), -1=用户名密码错误, -2=请求失败
+ */
+static int do_login_send(Session *s, const char *user, const char *final_sha, const char *sha2_pwd,
+                         const char *cid, const char *captcha, char *resp, size_t resp_sz) {
+    char enc_cid[512], enc_dc[512];
+    url_encode(cid, enc_cid, sizeof(enc_cid));
+    url_encode(s->device_code, enc_dc, sizeof(enc_dc));
+
+    char post[4096];
+    snprintf(post, sizeof(post),
+             "userAccount=%s&password=%s&sha256Password=%s&challengeId=%s&captchaCode=%s"
+             "&deviceCode=%s&deviceName=Chrome%%E6%%B5%%8F%%E8%%A7%%88%%E5%%99%%A8&deviceType=60"
+             "&deviceModel=Windows+NT+10.0%%3B+Win64%%3B+x64&appVersion=3.2.0"
+             "&sysVersion=Windows+NT+10.0%%3B+Win64%%3B+x64&clientVersion=103020001",
+             user, final_sha, sha2_pwd, enc_cid, captcha, enc_dc);
+
+    if (api_post_noauth(s, "https://desk.ctyun.cn:8810/api/auth/client/login",
+                        post, strlen(post), "application/x-www-form-urlencoded",
+                        resp, (int)resp_sz) < 0) {
+        return -2;
+    }
+
+    int code = jint(resp, "code");
+    if (code != 0) {
+        char msg[256];
+        jstr(resp, "msg", msg, sizeof(msg));
+        if (strcmp(msg, "\xe7\x94\xa8\xe6\x88\xb7\xe5\x90\x8d\xe6\x88\x96\xe5\xaf\x86\xe7\xa0\x81\xe9\x94\x99\xe8\xaf\xaf") == 0) {
+            return -1;
+        }
+        return 0;
+    }
+
+    const char *data_start = strstr(resp, "\"data\"");
+    if (!data_start) return 0;
+    data_start = strchr(data_start, '{');
+    if (!data_start) return 0;
+
+    const char *vstart;
+    int vlen;
+    char vtype;
+
+    if (json_find_key(data_start, "secretKey", &vstart, &vlen, &vtype) && vtype == 's') {
+        int copy_len = vlen < (int)sizeof(s->secret_key) - 1 ? vlen : (int)sizeof(s->secret_key) - 1;
+        memcpy(s->secret_key, vstart, copy_len);
+        s->secret_key[copy_len] = 0;
+    }
+    if (json_find_key(data_start, "userName", &vstart, &vlen, &vtype) && vtype == 's') {
+        int copy_len = vlen < (int)sizeof(s->user_name) - 1 ? vlen : (int)sizeof(s->user_name) - 1;
+        memcpy(s->user_name, vstart, copy_len);
+        s->user_name[copy_len] = 0;
+    }
+    if (json_find_key(data_start, "userAccount", &vstart, &vlen, &vtype) && vtype == 's') {
+        int copy_len = vlen < (int)sizeof(s->user_account) - 1 ? vlen : (int)sizeof(s->user_account) - 1;
+        memcpy(s->user_account, vstart, copy_len);
+        s->user_account[copy_len] = 0;
+    }
+    if (json_find_key(data_start, "userId", &vstart, &vlen, &vtype) && vtype == 'n') {
+        char num_buf[32];
+        int copy_len = vlen < 31 ? vlen : 31;
+        memcpy(num_buf, vstart, copy_len);
+        num_buf[copy_len] = 0;
+        s->user_id = atoi(num_buf);
+    }
+    if (json_find_key(data_start, "tenantId", &vstart, &vlen, &vtype) && vtype == 'n') {
+        char num_buf[32];
+        int copy_len = vlen < 31 ? vlen : 31;
+        memcpy(num_buf, vstart, copy_len);
+        num_buf[copy_len] = 0;
+        s->tenant_id = atoi(num_buf);
+    }
+    if (json_find_key(data_start, "bondedDevice", &vstart, &vlen, &vtype) && vtype == 'b') {
+        s->bonded_device = (vlen == 4);
+    }
+
+    s->logged_in = s->secret_key[0] ? 1 : 0;
+    return 1;
+}
+
 static int do_login(Session *s, const char *user, const char *pwd) {
     int auto_fail_count = 0;
+    uint8_t *img_data = NULL;
+    int img_len = 0;
+
     for (int attempt = 1; attempt <= 3; attempt++) {
         char resp[MAX_RESP];
 
@@ -1530,7 +1647,6 @@ static int do_login(Session *s, const char *user, const char *pwd) {
         jstr(resp, "challengeCode", ccode, sizeof(ccode));
         if (!cid[0]) { log_line("挑战码为空"); continue; }
 
-        /* 优化 (v1.2.3): 提前预计算所有密码哈希，避免手工/自动两个分支重复计算 */
         char final_sha[65], sha2_pwd[65];
         {
             char combined[512];
@@ -1546,265 +1662,145 @@ static int do_login(Session *s, const char *user, const char *pwd) {
         }
 
         char captcha[64] = "";
-        uint8_t *img_data = NULL;
-        int img_len = 0;
+        int use_manual = 0;
+
         int ocr_result = try_captcha_ocr(s, user, captcha, sizeof(captcha), &img_data, &img_len);
 
-        if (ocr_result == 2) {
+        if (ocr_result >= 2) {
+            int result = do_login_send(s, user, final_sha, sha2_pwd, cid, captcha, resp, sizeof(resp));
+            if (result == 1) {
+                log_line("登录成功: userId=%d, tenantId=%d, bondedDevice=%d", s->user_id, s->tenant_id, s->bonded_device);
+                if (img_data) free(img_data);
+                return 1;
+            }
+            if (result == -1) {
+                if (img_data) free(img_data);
+                return 0;
+            }
             auto_fail_count++;
+            if (auto_fail_count < 3) {
+                if (img_data) { free(img_data); img_data = NULL; }
+                continue;
+            }
+            use_manual = 1;
+        } else {
+            use_manual = 1;
         }
 
-        if (ocr_result < 2 || auto_fail_count >= 3) {
-            if (img_data && img_len > 0) {
-                show_captcha_window(img_data, img_len);
-            }
+        if (use_manual) {
             log_line("验证码自动识别失败，切换手工输入模式");
             int manual_fail = 0;
             while (manual_fail < 3) {
-                captcha[0] = 0;
-                if (!read_manual_captcha(captcha, sizeof(captcha))) {
+                if (!read_captcha_manual(img_data, img_len, captcha, sizeof(captcha))) {
                     log_line("手工输入为空");
                     manual_fail++;
                     continue;
                 }
-                close_captcha_window();
 
-                char enc_cid[512], enc_dc[512];
-                url_encode(cid, enc_cid, sizeof(enc_cid));
-                url_encode(s->device_code, enc_dc, sizeof(enc_dc));
-
-                char post[4096];
-                snprintf(post, sizeof(post),
-                         "userAccount=%s&password=%s&sha256Password=%s&challengeId=%s&captchaCode=%s"
-                         "&deviceCode=%s&deviceName=Chrome%%E6%%B5%%8F%%E8%%A7%%88%%E5%%99%%A8&deviceType=60"
-                         "&deviceModel=Windows+NT+10.0%%3B+Win64%%3B+x64&appVersion=3.2.0"
-                         "&sysVersion=Windows+NT+10.0%%3B+Win64%%3B+x64&clientVersion=103020001",
-                         user, final_sha, sha2_pwd, enc_cid, captcha, enc_dc);
-
-                log_line("正在发送登录请求 (手工验证码, 尝试%d)...", manual_fail + 1);
-                if (api_post_noauth(s, "https://desk.ctyun.cn:8810/api/auth/client/login",
-                                    post, strlen(post), "application/x-www-form-urlencoded",
-                                    resp, sizeof(resp)) < 0) {
-                    log_line("登录请求发送失败");
-                    manual_fail++;
-                    continue;
+                int result = do_login_send(s, user, final_sha, sha2_pwd, cid, captcha, resp, sizeof(resp));
+                if (result == 1) {
+                    log_line("登录成功: userId=%d, tenantId=%d, bondedDevice=%d", s->user_id, s->tenant_id, s->bonded_device);
+                    if (img_data) free(img_data);
+                    return 1;
                 }
-
-                code = jint(resp, "code");
-                log_line("登录响应: code=%d", code);
-                if (code != 0) {
-                    char msg[256];
-                    jstr(resp, "msg", msg, sizeof(msg));
-                    log_line("登录失败: %s", msg);
-                    if (strcmp(msg, "\xe7\x94\xa8\xe6\x88\xb7\xe5\x90\x8d\xe6\x88\x96\xe5\xaf\x86\xe7\xa0\x81\xe9\x94\x99\xe8\xaf\xaf") == 0) {
-                        close_captcha_window();
-                        if (img_data) free(img_data);
-                        return 0;
-                    }
-                    manual_fail++;
-                    continue;
+                if (result == -1) {
+                    if (img_data) free(img_data);
+                    return 0;
                 }
-
-                const char *p = strstr(resp, "\"data\"");
-                if (!p) { log_line("响应中无data字段"); manual_fail++; continue; }
-                p = strchr(p, '{');
-                if (!p) { log_line("data字段格式错误"); manual_fail++; continue; }
-
-                jstr(p, "secretKey", s->secret_key, sizeof(s->secret_key));
-                jstr(p, "userName", s->user_name, sizeof(s->user_name));
-                jstr(p, "userAccount", s->user_account, sizeof(s->user_account));
-                s->user_id = jint(p, "userId");
-                s->tenant_id = jint(p, "tenantId");
-                s->bonded_device = jbool(p, "bondedDevice");
-                log_line("登录成功: userId=%d, tenantId=%d, bondedDevice=%d", s->user_id, s->tenant_id, s->bonded_device);
-                s->logged_in = s->secret_key[0] ? 1 : 0;
-                if (img_data) free(img_data);
-                return s->logged_in;
+                manual_fail++;
             }
-            close_captcha_window();
             if (img_data) free(img_data);
             log_line("验证码识别错误");
             InterlockedExchange(&g_running, 0);
             return 0;
         }
-
-        if (img_data) { free(img_data); img_data = NULL; }
-
-        char enc_cid[512], enc_dc[512];
-        url_encode(cid, enc_cid, sizeof(enc_cid));
-        url_encode(s->device_code, enc_dc, sizeof(enc_dc));
-
-        char post[4096];
-        snprintf(post, sizeof(post),
-                 "userAccount=%s&password=%s&sha256Password=%s&challengeId=%s&captchaCode=%s"
-                 "&deviceCode=%s&deviceName=Chrome%%E6%%B5%%8F%%E8%%A7%%88%%E5%%99%%A8&deviceType=60"
-                 "&deviceModel=Windows+NT+10.0%%3B+Win64%%3B+x64&appVersion=3.2.0"
-                 "&sysVersion=Windows+NT+10.0%%3B+Win64%%3B+x64&clientVersion=103020001",
-                 user, final_sha, sha2_pwd, enc_cid, captcha, enc_dc);
-
-        log_line("正在发送登录请求 (尝试%d)...", attempt);
-        if (api_post_noauth(s, "https://desk.ctyun.cn:8810/api/auth/client/login",
-                            post, strlen(post), "application/x-www-form-urlencoded",
-                            resp, sizeof(resp)) < 0) {
-            log_line("登录请求发送失败");
-            continue;
-        }
-
-        code = jint(resp, "code");
-        log_line("登录响应: code=%d", code);
-        if (code != 0) {
-            char msg[256];
-            jstr(resp, "msg", msg, sizeof(msg));
-            log_line("登录失败: %s", msg);
-            if (strcmp(msg, "\xe7\x94\xa8\xe6\x88\xb7\xe5\x90\x8d\xe6\x88\x96\xe5\xaf\x86\xe7\xa0\x81\xe9\x94\x99\xe8\xaf\xaf") == 0)
-                return 0;
-            continue;
-        }
-
-        /*
-         * 优化5 (v1.2.2): 使用json_find_key单次扫描解析登录响应。
-         * 原逻辑: 先strstr定位"data"，再jstr/jint/jbool逐个字段从头扫描。
-         * 新逻辑: 在data对象范围内使用json_find_key单次遍历提取所有字段。
-         * 登录响应包含secretKey/userName/userAccount/userId/tenantId/bondedDevice，
-         * 单次扫描比6次独立查找更高效。
-         */
-        const char *data_start = strstr(resp, "\"data\"");
-        if (!data_start) { log_line("响应中无data字段"); continue; }
-        data_start = strchr(data_start, '{');
-        if (!data_start) { log_line("data字段格式错误"); continue; }
-
-        const char *vstart;
-        int vlen;
-        char vtype;
-
-        /* 提取secretKey */
-        if (json_find_key(data_start, "secretKey", &vstart, &vlen, &vtype) && vtype == 's') {
-            int copy_len = vlen < (int)sizeof(s->secret_key) - 1 ? vlen : (int)sizeof(s->secret_key) - 1;
-            memcpy(s->secret_key, vstart, copy_len);
-            s->secret_key[copy_len] = 0;
-        }
-        /* 提取userName */
-        if (json_find_key(data_start, "userName", &vstart, &vlen, &vtype) && vtype == 's') {
-            int copy_len = vlen < (int)sizeof(s->user_name) - 1 ? vlen : (int)sizeof(s->user_name) - 1;
-            memcpy(s->user_name, vstart, copy_len);
-            s->user_name[copy_len] = 0;
-        }
-        /* 提取userAccount */
-        if (json_find_key(data_start, "userAccount", &vstart, &vlen, &vtype) && vtype == 's') {
-            int copy_len = vlen < (int)sizeof(s->user_account) - 1 ? vlen : (int)sizeof(s->user_account) - 1;
-            memcpy(s->user_account, vstart, copy_len);
-            s->user_account[copy_len] = 0;
-        }
-        /* 提取userId */
-        if (json_find_key(data_start, "userId", &vstart, &vlen, &vtype) && vtype == 'n') {
-            char num_buf[32];
-            int copy_len = vlen < 31 ? vlen : 31;
-            memcpy(num_buf, vstart, copy_len);
-            num_buf[copy_len] = 0;
-            s->user_id = atoi(num_buf);
-        }
-        /* 提取tenantId */
-        if (json_find_key(data_start, "tenantId", &vstart, &vlen, &vtype) && vtype == 'n') {
-            char num_buf[32];
-            int copy_len = vlen < 31 ? vlen : 31;
-            memcpy(num_buf, vstart, copy_len);
-            num_buf[copy_len] = 0;
-            s->tenant_id = atoi(num_buf);
-        }
-        /* 提取bondedDevice */
-        if (json_find_key(data_start, "bondedDevice", &vstart, &vlen, &vtype) && vtype == 'b') {
-            s->bonded_device = (vlen == 4);  /* true=4, false=5 */
-        }
-
-        log_line("登录成功: userId=%d, tenantId=%d, bondedDevice=%d", s->user_id, s->tenant_id, s->bonded_device);
-        s->logged_in = s->secret_key[0] ? 1 : 0;
-        return s->logged_in;
     }
     log_line("登录失败，已重试3次");
+    if (img_data) free(img_data);
     return 0;
 }
 
 /* ======================== 短信验证码与设备绑定 ======================== */
 
+/**
+ * send_sms_request - 发送短信验证码请求
+ *
+ * @param s       会话信息
+ * @param phone   手机号
+ * @param captcha 图形验证码
+ * @return        1=成功发送, 0=发送失败(验证码错误), -1=请求失败
+ */
+static int send_sms_request(const Session *s, const char *phone, const char *captcha) {
+    char url[512];
+    snprintf(url, sizeof(url),
+             "https://desk.ctyun.cn:8810/api/cdserv/client/device/getSmsCode?mobilePhone=%s&captchaCode=%s",
+             phone, captcha);
+
+    char resp[MAX_RESP];
+    int rlen = api_get(s, url, resp, sizeof(resp));
+    if (rlen < 0) {
+        return -1;
+    }
+    int code = jint(resp, "code");
+    if (code == 0) {
+        return 1;
+    }
+    return 0;
+}
+
 static int send_sms_code(const Session *s, const char *phone) {
     int auto_fail_count = 0;
+    uint8_t *img_data = NULL;
+    int img_len = 0;
+
     for (int i = 0; i < 3; i++) {
         char captcha[64] = "";
-        uint8_t *img_data = NULL;
-        int img_len = 0;
+        int use_manual = 0;
+
         int ocr_result = try_captcha_ocr(s, NULL, captcha, sizeof(captcha), &img_data, &img_len);
 
-        if (ocr_result == 2) {
+        if (ocr_result >= 2) {
+            int result = send_sms_request(s, phone, captcha);
+            if (result == 1) {
+                log_line("短信验证码已发送至 %s", phone);
+                if (img_data) free(img_data);
+                return 1;
+            }
             auto_fail_count++;
+            if (auto_fail_count < 3) {
+                if (img_data) { free(img_data); img_data = NULL; }
+                continue;
+            }
+            use_manual = 1;
+        } else {
+            use_manual = 1;
         }
 
-        if (ocr_result < 2 || auto_fail_count >= 3) {
-            if (img_data && img_len > 0) {
-                show_captcha_window(img_data, img_len);
-            }
+        if (use_manual) {
             log_line("短信验证码自动识别失败，切换手工输入模式");
             int manual_fail = 0;
             while (manual_fail < 3) {
-                captcha[0] = 0;
-                if (!read_manual_captcha(captcha, sizeof(captcha))) {
+                if (!read_captcha_manual(img_data, img_len, captcha, sizeof(captcha))) {
                     log_line("手工输入为空");
                     manual_fail++;
                     continue;
                 }
-                close_captcha_window();
 
-                char url[512];
-                snprintf(url, sizeof(url),
-                         "https://desk.ctyun.cn:8810/api/cdserv/client/device/getSmsCode?mobilePhone=%s&captchaCode=%s",
-                         phone, captcha);
-
-                char resp[MAX_RESP];
-                int rlen = api_get(s, url, resp, sizeof(resp));
-                if (rlen < 0) {
-                    log_line("发送短信验证码请求失败 (手工, 尝试%d)", manual_fail + 1);
-                    manual_fail++;
-                    continue;
-                }
-                int code = jint(resp, "code");
-                if (code == 0) {
+                int result = send_sms_request(s, phone, captcha);
+                if (result == 1) {
                     log_line("短信验证码已发送至 %s", phone);
                     if (img_data) free(img_data);
                     return 1;
                 }
-                char msg[256];
-                jstr(resp, "msg", msg, sizeof(msg));
-                log_line("发送短信验证码错误 (手工, 尝试%d): %s", manual_fail + 1, msg);
                 manual_fail++;
             }
-            close_captcha_window();
             if (img_data) free(img_data);
             log_line("验证码识别错误");
             InterlockedExchange(&g_running, 0);
             return 0;
         }
-
-        if (img_data) { free(img_data); img_data = NULL; }
-
-        char url[512];
-        snprintf(url, sizeof(url),
-                 "https://desk.ctyun.cn:8810/api/cdserv/client/device/getSmsCode?mobilePhone=%s&captchaCode=%s",
-                 phone, captcha);
-
-        char resp[MAX_RESP];
-        int rlen = api_get(s, url, resp, sizeof(resp));
-        if (rlen < 0) {
-            log_line("发送短信验证码请求失败 (尝试%d)", i + 1);
-            continue;
-        }
-        int code = jint(resp, "code");
-        if (code == 0) {
-            log_line("短信验证码已发送至 %s", phone);
-            return 1;
-        }
-        char msg[256];
-        jstr(resp, "msg", msg, sizeof(msg));
-        log_line("发送短信验证码错误 (尝试%d): %s", i + 1, msg);
     }
+    if (img_data) free(img_data);
     return 0;
 }
 
