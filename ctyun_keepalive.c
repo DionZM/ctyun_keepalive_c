@@ -62,7 +62,7 @@
 #pragma comment(lib, "psapi.lib")       /* Process Status API: 内存信息 */
 
 /* ======================== 常量定义 ======================== */
-#define APP_VERSION   "1.3.2"
+#define APP_VERSION   "1.3.3"
 /*
  * 1.3.2 版本说明:
  * 1. 修复: 连接桌面成功提示增加桌面编号前缀
