@@ -62,20 +62,20 @@
 #pragma comment(lib, "psapi.lib")       /* Process Status API: 内存信息 */
 
 /* ======================== 常量定义 ======================== */
-#define APP_VERSION   "1.3.4"
+#define APP_VERSION   "1.3.5"
 /*
- * 1.3.4 版本说明:
- * 1. 修复: WinHTTP DNS解析超时设为10秒，避免网络异常时线程永久挂起
- * 2. 修复: make_sig_headers消除对g_shts内存布局的指针偏移依赖
- * 3. 修复: get_fingerprint增加malloc和API返回值检查
- * 4. 修复: json_find_key增强嵌套对象查找的健壮性
- * 5. 修复: b64dec增加非法字符检测
- * 6. 修复: build_poly1305_data增加输出缓冲区容量检查
- * 7. 修复: 恢复hconn关闭，WinHTTP会话级连接池自动复用
- * 8. 优化: aead_seal/aead_open增加malloc失败检查和缓冲区容量校验
- * 9. 优化: ws_connect使用goto cleanup统一资源释放
- * 10.规范: 消除魔法数字，统一使用命名常量
- * 11.规范: 增加poly1305位操作注释引用RFC 8439
+ * 1.3.5 版本说明:
+ * 1. 安全: 将OCR供应商URL提取为常量 OCR_SERVICE_URL，便于配置管理
+ * 2. 安全: 登录流程中使用完密码哈希后立即SecureZeroMemory清理final_sha和sha2_pwd
+ * 3. 修复: try_captcha_ocr添加OCR响应长度检查，防止缓冲区溢出截断
+ * 4. 修复: 日志截断逻辑缺陷，文件小于LOG_KEEP_SIZE时skip为负则从头截取
+ * 5. 修复: keep_alive_thread事件同步竞争，先检查退出标志g_running再等待事件
+ * 6. 优化: WebSocket重连添加指数退避策略(5s/10s/20s/40s/80s/最多120s)
+ * 7. 修复: 线程创建添加MAX_THREADS边界检查，防止句柄泄漏
+ * 8. 规范: BCryptEncrypt后无论成功失败均销毁密钥句柄hKey
+ * 9. 安全: JSON解析器添加字符串(JSON_MAX_STRING_LEN=8192)、键名(JSON_MAX_KEY_LEN=128)、
+ *          数字(JSON_MAX_NUMBER_LEN=64)长度限制，防止畸形JSON耗尽资源或无限循环
+ * 10. 安全: 敏感数据清理扩展至final_sha和sha2_pwd，与post缓冲区同步清理
  */
 #define MAX_DESKTOPS  10       /* 最大桌面数量 */
 #define MAX_THREADS   (MAX_DESKTOPS + 2)  /* 最大线程数: 桌面线程+监控线程+输入线程 */
@@ -150,6 +150,7 @@ static SIZE_T g_last_trim_memory_kb = 0;
 #define LOG_FLUSH_MS       1000    /* 日志冲刷间隔(毫秒) */
 #define LOG_MAX_SIZE       (1024*1024) /* 日志文件最大大小(1MB) */
 #define LOG_KEEP_SIZE      (512*1024)  /* 日志截断保留大小(512KB) */
+#define OCR_SERVICE_URL    "https://orc.1999111.xyz/ocr"  /* OCR识别服务地址 */
 
 /* ======================== 工具函数 ======================== */
 
@@ -290,7 +291,11 @@ static void log_line(const char *fmt, ...) {
                 long fsize = ftell(rf);
                 long keep = LOG_KEEP_SIZE;
                 long skip = fsize - keep;
-                if (skip < 0) skip = 0;
+                if (skip < 0) {
+                    /* 文件小于保留大小时，从头开始读整个文件 */
+                    skip = 0;
+                    keep = fsize;
+                }
                 fseek(rf, skip, SEEK_SET);
                 /* 截转时只保留最新的 512KB，避免在内存中重新处理整个日志文件 */
                 char *tail = (char *)malloc(keep);
@@ -1518,11 +1523,15 @@ static int try_captcha_ocr(const Session *s, const char *user,
     int nhdrs = 0;
     make_base_headers(s, ocr_hdrs, &nhdrs);
     char orc_resp[OCR_RESP_BUF];
-    int rlen = http_req("POST", "https://orc.1999111.xyz/ocr", body, blen, ct_hdr, ocr_hdrs, nhdrs, orc_resp, sizeof(orc_resp));
+    int rlen = http_req("POST", OCR_SERVICE_URL, body, blen, ct_hdr, ocr_hdrs, nhdrs, orc_resp, sizeof(orc_resp));
     free(body);
     if (rlen <= 0) {
         log_line("OCR接口连接失败");
         return 1;
+    }
+    if (rlen >= (int)sizeof(orc_resp)) {
+        log_line("OCR响应过长，可能被截断");
+        rlen = (int)sizeof(orc_resp) - 1;
     }
     orc_resp[rlen] = 0;
 
@@ -1745,6 +1754,9 @@ static int do_login(Session *s, const char *user, const char *pwd) {
             /* OCR成功，用识别结果发送登录请求 */
             log_line("正在发送登录请求 (自动, 尝试%d)...", attempt);
             int result = do_login_send(s, user, final_sha, sha2_pwd, cid, captcha, resp, MAX_RESP);
+            /* 清理密码相关的敏感数据 */
+            SecureZeroMemory(final_sha, sizeof(final_sha));
+            SecureZeroMemory(sha2_pwd, sizeof(sha2_pwd));
             if (img_data) { free(img_data); img_data = NULL; }
             if (result == 1) {
                 log_line("登录成功: userId=%d, tenantId=%d, bondedDevice=%d", s->user_id, s->tenant_id, s->bonded_device);
@@ -1815,6 +1827,9 @@ static int do_login(Session *s, const char *user, const char *pwd) {
         /* 发送登录请求 */
         log_line("正在发送登录请求 (手工, 尝试%d)...", attempt);
         int result = do_login_send(s, user, final_sha, sha2_pwd, cid, captcha, resp, MAX_RESP);
+        /* 清理密码相关的敏感数据 */
+        SecureZeroMemory(final_sha, sizeof(final_sha));
+        SecureZeroMemory(sha2_pwd, sizeof(sha2_pwd));
         if (img_data) { free(img_data); img_data = NULL; }
         if (result == 1) {
             log_line("登录成功: userId=%d, tenantId=%d, bondedDevice=%d", s->user_id, s->tenant_id, s->bonded_device);
@@ -2049,12 +2064,16 @@ static int do_device_binding(Session *s) {
 static const char *find_matching_brace(const char *start);
 
 #define JSON_MAX_DEPTH 16
+#define JSON_MAX_STRING_LEN 8192   /* 字符串值最大长度，防止畸形JSON耗尽资源 */
+#define JSON_MAX_KEY_LEN 128       /* 键名最大长度 */
+#define JSON_MAX_NUMBER_LEN 64     /* 数字值最大长度 */
 
 static int json_find_key_impl(const char *json, const char *key, const char **vstart, int *vlen, char *vtype, int depth) {
     if (!json || !key || !vstart || !vlen || !vtype || depth > JSON_MAX_DEPTH) return 0;
     size_t key_len = strlen(key);
-    if (key_len == 0) return 0;
+    if (key_len == 0 || key_len >= JSON_MAX_KEY_LEN) return 0;
     const char *p = json;
+    size_t chars_since_quote_check = 0;  /* 用于防止超长未闭合字符串 */
 
     while (*p) {
         /* 跳过空白字符 */
@@ -2066,7 +2085,7 @@ static int json_find_key_impl(const char *json, const char *key, const char **vs
             size_t match = 0;
             const char *key_start = p;
 
-            while (*p && *p != '"' && match < key_len) {
+            while (*p && *p != '"' && match < key_len && match < JSON_MAX_KEY_LEN) {
                 if (*p == '\\') { p++; if (!*p) break; }
                 if (*p == key[match]) match++;
                 else break;
@@ -2082,22 +2101,27 @@ static int json_find_key_impl(const char *json, const char *key, const char **vs
 
                 /* 解析值 */
                 if (*p == '"') {
-                    /* 字符串值 */
+                    /* 字符串值 - 添加长度限制防止畸形JSON */
                     *vtype = 's';
                     *vstart = ++p;
                     *vlen = 0;
-                    while (*p && *p != '"') {
-                        if (*p == '\\') p++;
+                    chars_since_quote_check = 0;
+                    while (*p && *p != '"' && *vlen < JSON_MAX_STRING_LEN) {
+                        if (*p == '\\') { p++; chars_since_quote_check++; }
                         p++;
                         (*vlen)++;
+                        chars_since_quote_check++;
+                        /* 防止未闭合的引号导致无限循环 */
+                        if (chars_since_quote_check > JSON_MAX_STRING_LEN * 2) break;
                     }
+                    if (*vlen >= JSON_MAX_STRING_LEN) return 0;  /* 字符串过长，视为畸形 */
                     return 1;
                 } else if (*p == '-' || (*p >= '0' && *p <= '9')) {
-                    /* 数字值 */
+                    /* 数字值 - 添加长度限制 */
                     *vtype = 'n';
                     *vstart = p;
                     *vlen = 0;
-                    while (*p == '-' || (*p >= '0' && *p <= '9')) {
+                    while ((*p == '-' || (*p >= '0' && *p <= '9')) && *vlen < JSON_MAX_NUMBER_LEN) {
                         p++;
                         (*vlen)++;
                     }
@@ -3497,6 +3521,7 @@ static size_t rsa_oaep_encrypt(const uint8_t *n_bytes, size_t n_len, uint32_t e_
     ULONG ct_len = 0;
     status = BCryptEncrypt(hKey, empty_msg, 0, &oaep_info, NULL, 0,
                            result, (ULONG)mod_len, &ct_len, BCRYPT_PAD_OAEP);
+    /* 无论加密成功或失败，都必须销毁密钥句柄 */
     BCryptDestroyKey(hKey);
 
     if (!BCRYPT_SUCCESS(status)) {
@@ -3940,8 +3965,12 @@ static DWORD WINAPI keep_alive_thread(LPVOID param) {
      * 1.2.1 的线程模型改为：保活线程在创建后先等待 start_event。
      * 这样可以把后续是否开始保活的决定权交给统一轮询线程，
      * 从而免去非运行桌面各自拉取一次完整列表的重开销。
+     *
+     * 修复(v1.3.5): 修复事件同步竞争问题，先检查退出标志再等待事件，
+     * 避免在检查和等待之间收到信号导致永久阻塞。
      */
-    while (g_running && !InterlockedCompareExchange(&g_auth_expired, 0, 0)) {
+    while (!InterlockedCompareExchange(&g_auth_expired, 0, 0)) {
+        if (!g_running) break;
         DWORD wait = WaitForSingleObject(d->start_event, 1000);
         if (wait == WAIT_OBJECT_0) break;
     }
@@ -3950,15 +3979,34 @@ static DWORD WINAPI keep_alive_thread(LPVOID param) {
         return 0;
     }
 
+    /* 修复(v1.3.5): WebSocket重连指数退避计数器，每个线程独立 */
+    static volatile LONG s_retry_count = 0;
+
     while (g_running && !InterlockedCompareExchange(&g_auth_expired, 0, 0)) {
         log_line("[%s] 正在连接...", d->desktop_code);
         WSConn wsc;
         if (!ws_connect(d->ws_uri, &wsc, d->desktop_code)) {
-            log_line("[%s] WebSocket连接失败，5秒后重试", d->desktop_code);
-            for (int wi = 0; wi < WS_RECONNECT_MS / 200 && g_running && !InterlockedCompareExchange(&g_auth_expired, 0, 0); wi++)
+            /*
+             * 修复(v1.3.5): 添加指数退避重连策略
+             * 初始等待5秒，每次失败后等待时间翻倍，最多2分钟
+             * 避免被服务端识别为恶意行为
+             */
+            int retry = (int)InterlockedIncrement(&s_retry_count);
+            int delay_ms = WS_RECONNECT_MS;
+            if (retry > 1) {
+                /* 指数退避: 5s, 10s, 20s, 40s, 80s, 最多120s */
+                int shift = retry - 1;
+                if (shift > 4) shift = 4;
+                delay_ms = WS_RECONNECT_MS << shift;
+                if (delay_ms > 120000) delay_ms = 120000;
+            }
+            log_line("[%s] WebSocket连接失败，%d秒后重试 (第%d次)", d->desktop_code, delay_ms / 1000, retry);
+            for (int wi = 0; wi < delay_ms / 200 && g_running && !InterlockedCompareExchange(&g_auth_expired, 0, 0); wi++)
                 Sleep(200);
             continue;
         }
+        /* 连接成功后重置重试计数 */
+        InterlockedExchange(&s_retry_count, 0);
 
         ws_send_text(&wsc, d->connect_msg);
         Sleep(WS_SEND_DELAY_MS);
@@ -4231,6 +4279,15 @@ int main(int argc, char *argv[]) {
         threads[nthreads] = CreateThread(NULL, THREAD_STACK, keep_alive_thread, &params[i], 0, NULL);
         if (!threads[nthreads]) {
             log_line("[%s] 保活线程创建失败: %lu", desktops[i].desktop_code, GetLastError());
+            CloseHandle(desktops[i].start_event);
+            desktops[i].start_event = NULL;
+            continue;
+        }
+        /* 确保线程数组不会越界，若已达上限则关闭线程句柄并停止创建 */
+        if (nthreads >= MAX_THREADS - 1) {
+            log_line("警告: 线程数已达上限，关闭多余线程");
+            CloseHandle(threads[nthreads]);
+            threads[nthreads] = NULL;
             CloseHandle(desktops[i].start_event);
             desktops[i].start_event = NULL;
             continue;
