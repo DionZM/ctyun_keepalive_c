@@ -290,12 +290,12 @@ static void log_line(const char *fmt, ...) {
             fflush(g_log_file);
             g_log_last_flush = GetTickCount();
         }
-        /* 检查文件大小，超过1MB时截断保留末尾512KB */
+        /* 检查文件大小，超过LOG_MAX_SIZE时截断保留末尾LOG_KEEP_SIZE */
         if (g_log_size > LOG_MAX_SIZE) {
             fflush(g_log_file);
             fclose(g_log_file);
             g_log_file = NULL;
-            /* 读取文件末尾512KB */
+            /* 读取文件末尾LOG_KEEP_SIZE字节 */
             FILE *rf = fopen(g_log_path, "rb");
             if (rf) {
                 fseek(rf, 0, SEEK_END);
@@ -308,15 +308,22 @@ static void log_line(const char *fmt, ...) {
                     keep = fsize;
                 }
                 fseek(rf, skip, SEEK_SET);
-                /* 截转时只保留最新的 512KB，避免在内存中重新处理整个日志文件 */
+                /* 截转时只保留最新的LOG_KEEP_SIZE，避免在内存中重新处理整个日志文件 */
                 char *tail = (char *)malloc(keep);
                 size_t nread = tail ? fread(tail, 1, keep, rf) : 0;
                 fclose(rf);
                 /* 重写文件，只保留末尾部分 */
                 g_log_file = open_log_file(g_log_path, "w", &g_log_size);
                 if (g_log_file && tail) {
-                    fwrite(tail, 1, nread, g_log_file);
-                    g_log_size = (long)nread;
+                    /* tail 开头通常落在某条日志行中间，跳过首个不完整行，
+                     * 避免写入半行日志造成后续解析/阅读混乱 */
+                    size_t start_off = 0;
+                    const char *nl = (const char *)memchr(tail, '\n', nread);
+                    if (nl && (size_t)(nl - tail) + 1 < nread) {
+                        start_off = (size_t)(nl - tail) + 1;
+                    }
+                    fwrite(tail + start_off, 1, nread - start_off, g_log_file);
+                    g_log_size = (long)(nread - start_off);
                     fflush(g_log_file);
                     g_log_last_flush = GetTickCount();
                 }
@@ -435,6 +442,9 @@ static size_t url_encode(const char *in, char *out, size_t out_sz) {
         ['-']=1,['_']=1,['.']=1,['~']=1
     };
     size_t j = 0;
+    /* 输出缓冲区至少需要 4 字节(最坏情况: 1个安全字符 + 3字节 %XX 仍需收尾的 '\0')。
+     * 当 out_sz < 4 时，out_sz - 4 会下溢成巨大值导致越界写入，这里直接防御。 */
+    if (out_sz < 4) { if (out_sz > 0) out[0] = 0; return 0; }
     for (size_t i = 0; in[i] && j < out_sz - 4; i++) {
         unsigned char c = (unsigned char)in[i];
         if (URL_SAFE[c]) {
@@ -647,6 +657,8 @@ static const char *find_in_range(const char *start, const char *end, const char 
 }
 
 static char *jstr_range(const char *start, const char *end, const char *k, char *buf, size_t bsz) {
+    /* 与 jstr() 保持一致: 超长键名直接判失败，避免 srch 被静默截断导致误匹配 */
+    if (strlen(k) > 120) { buf[0] = 0; return buf; }
     char srch[128];
     snprintf(srch, sizeof(srch), "\"%s\"", k);
     const char *p = find_in_range(start, end, srch);
@@ -2424,6 +2436,7 @@ static int connect_desktop(Session *s, Desktop *d) {
 
     /* 使用临时缓冲区提取字段，再str_dup到堆上 */
     char *tmp = NULL;
+    int tmp_cap = 0;
     for (int ki = 0; ki < info_key_count; ki++) {
         /* 构造搜索模式: "keyname" */
         char key_pattern[64];
@@ -2436,8 +2449,13 @@ static int connect_desktop(Session *s, Desktop *d) {
         if (!di_end) continue;
 
         int len = (int)(di_end - di + 1);
-        tmp = (char *)malloc(len + 1);
-        if (!tmp) { free(resp); return 0; }
+        /* 复用缓冲区，避免每轮 malloc 造成内存泄漏 */
+        if (len + 1 > tmp_cap) {
+            free(tmp);
+            tmp = (char *)malloc(len + 1);
+            if (!tmp) { tmp_cap = 0; free(resp); return 0; }
+            tmp_cap = len + 1;
+        }
 
         jstr_range(di, di_end + 1, "host", tmp, len + 1);
         d->host = str_dup(tmp);
@@ -2474,6 +2492,8 @@ static int connect_desktop(Session *s, Desktop *d) {
         free(d->token); d->token = NULL;
         free(d->tenant_account); d->tenant_account = NULL;
     }
+    free(tmp);
+    tmp = NULL;
     if (!d->host || !d->host[0]) {
         log_line("[%s] 错误: 连接响应缺少host字段", d->desktop_code);
         free(d->host); d->host = NULL;
@@ -3804,11 +3824,13 @@ cleanup:
  *
  * @param wsc   WebSocket连接
  * @param text  文本消息内容
+ * @return      0=成功, -1=发送失败(连接可能已断开)
  */
-static void ws_send_text(WSConn *wsc, const char *text) {
+static int ws_send_text(WSConn *wsc, const char *text) {
     size_t len = strlen(text);
-    WinHttpWebSocketSend(wsc->hWebSocket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
+    DWORD err = WinHttpWebSocketSend(wsc->hWebSocket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
                           (void *)text, (DWORD)len);
+    return (err == ERROR_SUCCESS) ? 0 : -1;
 }
 
 /**
@@ -3817,10 +3839,12 @@ static void ws_send_text(WSConn *wsc, const char *text) {
  * @param wsc   WebSocket连接
  * @param data  二进制数据
  * @param dlen  数据长度
+ * @return      0=成功, -1=发送失败(连接可能已断开)
  */
-static void ws_send_bytes(WSConn *wsc, const uint8_t *data, size_t dlen) {
-    WinHttpWebSocketSend(wsc->hWebSocket, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
+static int ws_send_bytes(WSConn *wsc, const uint8_t *data, size_t dlen) {
+    DWORD err = WinHttpWebSocketSend(wsc->hWebSocket, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
                           (void *)data, (DWORD)dlen);
+    return (err == ERROR_SUCCESS) ? 0 : -1;
 }
 
 /**
@@ -3843,36 +3867,6 @@ static int ws_recv(WSConn *wsc, uint8_t *out, size_t outsz, int *is_text) {
     *is_text = (bufType == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE ||
                 bufType == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE);
     return (int)bytesRead;
-}
-
-/**
- * ws_recv_polling - 带超时容错的接收
- *
- * 使用 ws_recv 接收数据，但将超时类错误视为"暂无数据"(返回0)，
- * 而非连接断开。这样保活循环可以定期回到 timer 检查逻辑发送ping/mouse。
- *
- * 注意: WinHttpQueryDataAvailable 不支持WebSocket句柄(error 12018)，
- *       因此直接使用 ws_recv + 超时错误容错的方式。
- *
- * @return  >0 收到字节数, 0 无数据/超时, -1 连接关闭或严重错误
- */
-static int ws_recv_polling(WSConn *wsc, uint8_t *out, size_t outsz, int *is_text) {
-    int n = ws_recv(wsc, out, outsz, is_text);
-    if (n < 0) {
-        DWORD err = GetLastError();
-        /* 以下错误视为"暂时无数据"，返回0让循环继续检查timer */
-        if (err == ERROR_WINHTTP_TIMEOUT ||
-            err == ERROR_WINHTTP_OPERATION_CANCELLED ||
-            err == ERROR_IO_PENDING ||
-            err == 12018 ||  /* ERROR_INTERNET_INVALID_OPERATION */
-            err == 0) {       /* 有时GetLastError()在成功路径后为0 */
-            return 0;
-        }
-        /* 其他错误: 连接真正断开 */
-        log_line("[DEBUG] ws_recv致命错误 code=%lu", err);
-        return -1;
-    }
-    return n;
 }
 
 /**
@@ -4074,6 +4068,10 @@ typedef struct {
  *
  * 共享WSConn指针，心跳线程负责定时发送ping/mouse，
  * 主线程负责阻塞接收消息。两者操作同一WebSocket句柄。
+ *
+ * 生命周期约定: HeartbeatParam 通常位于 keep_alive_thread 的栈帧上，
+ * 心跳线程在每次访问字段前都会先检查 stop_flag；主线程在等待心跳线程
+ * 退出(Exit)之前绝不释放/复用该栈帧，从而避免 use-after-free。
  */
 typedef struct {
     WSConn *wsc;                  /* 共享的WebSocket连接(用于发送/关闭) */
@@ -4102,7 +4100,12 @@ static DWORD WINAPI heartbeat_thread(LPVOID param) {
     int should_close = 0;
 
     while (!InterlockedCompareExchange(hp->stop_flag, 0, 0)) {
-        Sleep(5000);  /* 每5秒检查一次 */
+        /* 以200ms粒度轮询，保证主线程设置stop_flag后能在3000ms等待内退出，
+         * 避免心跳线程访问已被主线程复用/释放的栈帧(HeartbeatParam)。 */
+        for (int si = 0; si < 25; si++) {
+            if (InterlockedCompareExchange(hp->stop_flag, 0, 0)) break;
+            Sleep(200);
+        }
         if (InterlockedCompareExchange(hp->stop_flag, 0, 0)) break;
 
         DWORD now = GetTickCount();
@@ -4144,8 +4147,8 @@ static DWORD WINAPI heartbeat_thread(LPVOID param) {
  * 1. 建立WebSocket连接(使用预构建的ws_uri)
  * 2. 发送连接消息(使用预构建的connect_msg)
  * 3. 发送初始二进制载荷
- * 4. 维持连接60秒，期间处理REDQ认证请求
- * 5. 60秒后断开重连(防止服务端超时)
+ * 4. 维持连接45秒，期间处理REDQ认证请求
+ * 5. 45秒后断开重连(抢在服务端zombie检测之前)
  * 6. 每5个周期(约5分钟)修剪一次工作集
  *
  * 保活原理:
@@ -4188,8 +4191,9 @@ static DWORD WINAPI keep_alive_thread(LPVOID param) {
         return 0;
     }
 
-    /* 修复(v1.3.5): WebSocket重连指数退避计数器，每个线程独立 */
-    static volatile LONG s_retry_count = 0;
+    /* WebSocket重连指数退避计数器，每个线程独立(必须是栈变量，不能是static，
+     * 否则所有桌面线程会共享同一个计数器并互相干扰退避节奏) */
+    volatile LONG s_retry_count = 0;
 
     while (g_running && !InterlockedCompareExchange(&g_auth_expired, 0, 0)) {
         log_line("[%s] 正在连接...", d->desktop_code);
@@ -4217,10 +4221,20 @@ static DWORD WINAPI keep_alive_thread(LPVOID param) {
         /* 连接成功后重置重试计数 */
         InterlockedExchange(&s_retry_count, 0);
 
-        ws_send_text(&wsc, d->connect_msg);
+        if (ws_send_text(&wsc, d->connect_msg) != 0) {
+            log_line("[%s] [DEBUG] connect_msg发送失败，断开重连", d->desktop_code);
+            /* 此处心跳线程尚未创建，直接关闭连接进入重连 */
+            ws_close(&wsc);
+            continue;
+        }
         log_line("[%s] [DEBUG] connect_msg已发送(%dB)", d->desktop_code, (int)strlen(d->connect_msg));
         Sleep(WS_SEND_DELAY_MS);
-        ws_send_bytes(&wsc, initial_payload, sizeof(initial_payload));
+        if (ws_send_bytes(&wsc, initial_payload, sizeof(initial_payload)) != 0) {
+            log_line("[%s] [DEBUG] REDQ initial_payload发送失败，断开重连", d->desktop_code);
+            /* 此处心跳线程尚未创建，直接关闭连接进入重连 */
+            ws_close(&wsc);
+            continue;
+        }
         log_line("[%s] [DEBUG] REDQ initial_payload已发送(%zuB)", d->desktop_code, sizeof(initial_payload));
         user_payload_sent = 0;
 
@@ -4249,7 +4263,8 @@ static DWORD WINAPI keep_alive_thread(LPVOID param) {
         uint8_t reply_buf[4096];
         size_t  reply_len = 0;
 
-        while (g_running && (GetTickCount() - start) < WS_KEEPALIVE_MS) {
+        while (g_running && !InterlockedCompareExchange(&g_auth_expired, 0, 0) &&
+               (GetTickCount() - start) < WS_KEEPALIVE_MS) {
             int is_text;
             int n = ws_recv(&wsc, ws_buf, WS_RECV_BUF_SIZE, &is_text);
             if (n < 0) {
@@ -4340,7 +4355,10 @@ static DWORD WINAPI keep_alive_thread(LPVOID param) {
 
                 /* ★ 批量发送本批次收集的所有回复(在recv循环外发送，避免状态机冲突) ★ */
                 if (reply_len > 0) {
-                    ws_send_bytes(&wsc, reply_buf, reply_len);
+                    if (ws_send_bytes(&wsc, reply_buf, reply_len) != 0) {
+                        log_line("[%s] [DEBUG] 批量回复发送失败，断开重连", d->desktop_code);
+                        goto recv_loop_done;
+                    }
                     log_line("[%s] [BATCH] 批量回复 %zuB", d->desktop_code, reply_len);
                 }
             } else if (is_text) {
@@ -4349,6 +4367,7 @@ static DWORD WINAPI keep_alive_thread(LPVOID param) {
                 log_line("[%s] [DEBUG] 其他小包 is_text=%d n=%d", d->desktop_code, is_text, n);
             }
         }
+    recv_loop_done: ;
 
         /* 本周期结束: 打印汇总的所有协议类型 */
         if (seen_type_count > 0) {
@@ -4364,8 +4383,14 @@ static DWORD WINAPI keep_alive_thread(LPVOID param) {
         /* 停止心跳线程并等待退出 */
         InterlockedExchange(&hb_stop, 1);
         if (hHeartbeat) {
-            WaitForSingleObject(hHeartbeat, 3000);  /* 等待最多3秒 */
+            /* 心跳线程内部以200ms粒度轮询hb_stop，最长 ~5s 必然退出 */
+            DWORD wait_result = WaitForSingleObject(hHeartbeat, 6000);
             CloseHandle(hHeartbeat);
+            if (wait_result != WAIT_OBJECT_0) {
+                /* 极端情况下仍超时：不再访问可能被复用的栈帧，
+                 * 直接放弃该心跳线程(被托管)，避免 use-after-free */
+                log_line("[%s] 警告: 心跳线程未及时退出", d->desktop_code);
+            }
         }
 
         ws_close(&wsc);
@@ -4606,18 +4631,21 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        threads[nthreads] = CreateThread(NULL, THREAD_STACK, keep_alive_thread, &params[i], 0, NULL);
-        if (!threads[nthreads]) {
-            log_line("[%s] 保活线程创建失败: %lu", desktops[i].desktop_code, GetLastError());
+        /* 先判断是否还有线程槽位，避免创建后才发现越界。
+         * 此前的"先CreateThread再判断越界"会把已创建的线程靠CloseHandle
+         * 释放(不会等待其退出)，且对应 start_event 也被关闭，使该线程
+         * 在 WaitForSingleObject(已关闭句柄) 上行为未定义。 */
+        if (nthreads >= MAX_THREADS - 1) {
+            log_line("警告: 线程数已达上限(%d)，跳过桌面[%s]",
+                     MAX_THREADS - 1, desktops[i].desktop_code);
             CloseHandle(desktops[i].start_event);
             desktops[i].start_event = NULL;
             continue;
         }
-        /* 确保线程数组不会越界，若已达上限则关闭线程句柄并停止创建 */
-        if (nthreads >= MAX_THREADS - 1) {
-            log_line("警告: 线程数已达上限，关闭多余线程");
-            CloseHandle(threads[nthreads]);
-            threads[nthreads] = NULL;
+
+        threads[nthreads] = CreateThread(NULL, THREAD_STACK, keep_alive_thread, &params[i], 0, NULL);
+        if (!threads[nthreads]) {
+            log_line("[%s] 保活线程创建失败: %lu", desktops[i].desktop_code, GetLastError());
             CloseHandle(desktops[i].start_event);
             desktops[i].start_event = NULL;
             continue;
