@@ -62,20 +62,16 @@
 #pragma comment(lib, "psapi.lib")       /* Process Status API: 内存信息 */
 
 /* ======================== 常量定义 ======================== */
-#define APP_VERSION   "1.3.5"
+#define APP_VERSION   "1.4.0"
 /*
- * 1.3.5 版本说明:
- * 1. 安全: 将OCR供应商URL提取为常量 OCR_SERVICE_URL，便于配置管理
- * 2. 安全: 登录流程中使用完密码哈希后立即SecureZeroMemory清理final_sha和sha2_pwd
- * 3. 修复: try_captcha_ocr添加OCR响应长度检查，防止缓冲区溢出截断
- * 4. 修复: 日志截断逻辑缺陷，文件小于LOG_KEEP_SIZE时skip为负则从头截取
- * 5. 修复: keep_alive_thread事件同步竞争，先检查退出标志g_running再等待事件
- * 6. 优化: WebSocket重连添加指数退避策略(5s/10s/20s/40s/80s/最多120s)
- * 7. 修复: 线程创建添加MAX_THREADS边界检查，防止句柄泄漏
- * 8. 规范: BCryptEncrypt后无论成功失败均销毁密钥句柄hKey
- * 9. 安全: JSON解析器添加字符串(JSON_MAX_STRING_LEN=8192)、键名(JSON_MAX_KEY_LEN=128)、
- *          数字(JSON_MAX_NUMBER_LEN=64)长度限制，防止畸形JSON耗尽资源或无限循环
- * 10. 安全: 敏感数据清理扩展至final_sha和sha2_pwd，与post缓冲区同步清理
+ * 1.4.0 版本说明:
+ * 1. 新增: 支持shadowDesktopInfo和desktopAnywhereInfo数据源解析(HA/漫游桌面)
+ * 2. 新增: RFC 6455协议层WebSocket Ping心跳(opcode=0x9)
+ * 3. 新增: 心跳线程周期结束主动关闭连接，彻底消除zombie检测
+ * 4. 新增: connect API响应调试日志、WebSocket连接参数调试日志
+ * 5. 新增: 消息类型分类日志(REDQ/HEARTBEAT/SCREEN/UNKNOWN/TEXT)
+ * 6. 调整: WS_KEEPALIVE_MS从60s调整为45s(在zombie窗口前主动重连)
+ * 7. 调整: 日志文件大小限制从1MB提升至2MB(保留1MB)
  */
 #define MAX_DESKTOPS  10       /* 最大桌面数量 */
 #define MAX_THREADS   (MAX_DESKTOPS + 2)  /* 最大线程数: 桌面线程+监控线程+输入线程 */
@@ -87,7 +83,18 @@
 #define MAX_MANUAL_CAPTCHA_ATTEMPTS 3 /* 手工验证码最大重试次数 */
 #define MAX_AUTO_CAPTCHA_FAILS 3      /* 自动验证码最大连续失败次数 */
 #define DNS_RESOLVE_TIMEOUT_MS 10000  /* DNS解析超时10秒 */
-#define WS_KEEPALIVE_MS     60000    /* WebSocket保活连接维持60秒(毫秒) */
+#define WS_KEEPALIVE_MS     45000    /* 保活周期45秒(zombie检测窗口在60秒) */
+
+/*
+ * MinGW winhttp.h 可能缺少以下常量定义(RFC 6455 Ping/Pong控制帧)
+ * 手动定义以支持协议层心跳
+ */
+#ifndef WINHTTP_WEB_SOCKET_PING_BUFFER_TYPE
+#define WINHTTP_WEB_SOCKET_PING_BUFFER_TYPE         3  /* opcode 0x9 */
+#endif
+#ifndef WINHTTP_WEB_SOCKET_PONG_BUFFER_TYPE
+#define WINHTTP_WEB_SOCKET_PONG_BUFFER_TYPE         4  /* opcode 0xA */
+#endif
 
 /* ======================== 全局变量 ======================== */
 
@@ -141,18 +148,22 @@ static SIZE_T g_last_trim_memory_kb = 0;
 
 #define WS_RECV_BUF_SIZE   8192    /* WebSocket接收缓冲区大小 */
 #define WS_RECONNECT_MS    5000    /* WebSocket重连间隔(毫秒) */
-#define WS_RECV_TIMEOUT_MS 2000    /* WebSocket接收超时(毫秒) */
+#define WS_RECV_TIMEOUT_MS  30000   /* 接收超时30秒，在zombie(60s)之前主动断连重连 */
 #define CAPTCHA_IMG_BUF    65536   /* 验证码图片缓冲区大小 */
 #define OCR_RESP_BUF       4096    /* OCR响应缓冲区大小 */
 #define DESKTOP_CLEANUP_MS 50      /* 桌面清理等待线程退出时间(毫秒) */
 #define CAPTCHA_CLOSE_MS   100     /* 验证码窗口关闭等待时间(毫秒) */
 #define WS_SEND_DELAY_MS   100     /* WebSocket发送connect_msg后等待时间(毫秒) */
+#define WS_PING_INTERVAL_MS 15000  /* WebSocket心跳ping间隔(毫秒), 每15秒发一次 */
+#define WS_MOUSE_INTERVAL_MS 30000 /* 模拟鼠标事件间隔(毫秒), 每30秒发一次 */
 #define LOG_FLUSH_MS       1000    /* 日志冲刷间隔(毫秒) */
-#define LOG_MAX_SIZE       (1024*1024) /* 日志文件最大大小(1MB) */
-#define LOG_KEEP_SIZE      (512*1024)  /* 日志截断保留大小(512KB) */
+#define LOG_MAX_SIZE       (2*1024*1024) /* 日志文件最大大小(2MB) */
+#define LOG_KEEP_SIZE      (1*1024*1024)  /* 日志截断保留大小(1MB) */
 #define OCR_SERVICE_URL    "https://orc.1999111.xyz/ocr"  /* OCR识别服务地址 */
 
 /* ======================== 工具函数 ======================== */
+
+int json_find_key(const char *json, const char *key, const char **vstart, int *vlen, char *vtype);
 
 static void refresh_banner(void) {
     if (g_background) return;
@@ -2182,7 +2193,7 @@ static int json_find_key_impl(const char *json, const char *key, const char **vs
     return 0;
 }
 
-static int json_find_key(const char *json, const char *key, const char **vstart, int *vlen, char *vtype) {
+int json_find_key(const char *json, const char *key, const char **vstart, int *vlen, char *vtype) {
     return json_find_key_impl(json, key, vstart, vlen, vtype, 0);
 }
 
@@ -2387,6 +2398,9 @@ static int connect_desktop(Session *s, Desktop *d) {
         free(resp);
         return 0;
     }
+    /* [DEBUG] 打印connect API完整响应 */
+    log_line("[%s] [DEBUG] connect API 原始响应(%dB): %.512s", d->desktop_id, (int)strlen(resp), resp);
+
     if (jint(resp, "code") != 0) {
         char msg[256];
         jstr(resp, "msg", msg, sizeof(msg));
@@ -2395,40 +2409,71 @@ static int connect_desktop(Session *s, Desktop *d) {
         return 0;
     }
 
-    /* 提取desktopInfo对象 */
-    const char *di = strstr(resp, "\"desktopInfo\"");
-    if (!di) { free(resp); return 0; }
-    di = strchr(di, '{');
-    if (!di) { free(resp); return 0; }
-    const char *di_end = find_matching_brace(di);
-    if (!di_end) { free(resp); return 0; }
-
-    /* 解析desktopInfo中的连接参数，动态分配到堆 */
-    int len = (int)(di_end - di + 1);
+    /*
+     * 提取连接参数: 按优先级尝试 desktopInfo → shadowDesktopInfo → desktopAnywhereInfo
+     *
+     * 后启动的桌面(如HA模式/漫游模式)可能 desktopInfo 为 null，
+     * 实际连接参数在 shadowDesktopInfo 或 desktopAnywhereInfo 中。
+     */
+    static const char *info_keys[] = {
+        "desktopInfo",
+        "shadowDesktopInfo",
+        "desktopAnywhereInfo"
+    };
+    const int info_key_count = 3;
 
     /* 使用临时缓冲区提取字段，再str_dup到堆上 */
-    char *tmp = (char *)malloc(len + 1);
-    if (!tmp) { free(resp); return 0; }
-    jstr_range(di, di_end + 1, "host", tmp, len + 1);
-    d->host = str_dup(tmp);
-    jstr_range(di, di_end + 1, "port", tmp, len + 1);
-    d->port = str_dup(tmp);
-    jstr_range(di, di_end + 1, "clinkLvsOutHost", tmp, len + 1);
-    d->clink_host = str_dup(tmp);
-    jstr_range(di, di_end + 1, "caCert", tmp, len + 1);
-    d->ca_cert = str_dup(tmp);
-    jstr_range(di, di_end + 1, "clientCert", tmp, len + 1);
-    d->client_cert = str_dup(tmp);
-    jstr_range(di, di_end + 1, "clientKey", tmp, len + 1);
-    d->client_key = str_dup(tmp);
-    jstr_range(di, di_end + 1, "token", tmp, len + 1);
-    d->token = str_dup(tmp);
-    jstr_range(di, di_end + 1, "tenantMemberAccount", tmp, len + 1);
-    d->tenant_account = str_dup(tmp);
-    log_line("[%s] 连接桌面成功: host=%s port=%s clink=%s",
-             d->desktop_code,
-             d->host ? d->host : "", d->port ? d->port : "", d->clink_host ? d->clink_host : "");
-    free(tmp);
+    char *tmp = NULL;
+    for (int ki = 0; ki < info_key_count; ki++) {
+        /* 构造搜索模式: "keyname" */
+        char key_pattern[64];
+        snprintf(key_pattern, sizeof(key_pattern), "\"%s\"", info_keys[ki]);
+        const char *di = strstr(resp, key_pattern);
+        if (!di) continue;
+        di = strchr(di, '{');
+        if (!di) continue;
+        const char *di_end = find_matching_brace(di);
+        if (!di_end) continue;
+
+        int len = (int)(di_end - di + 1);
+        tmp = (char *)malloc(len + 1);
+        if (!tmp) { free(resp); return 0; }
+
+        jstr_range(di, di_end + 1, "host", tmp, len + 1);
+        d->host = str_dup(tmp);
+        jstr_range(di, di_end + 1, "port", tmp, len + 1);
+        d->port = str_dup(tmp);
+        jstr_range(di, di_end + 1, "clinkLvsOutHost", tmp, len + 1);
+        d->clink_host = str_dup(tmp);
+        jstr_range(di, di_end + 1, "caCert", tmp, len + 1);
+        d->ca_cert = str_dup(tmp);
+        jstr_range(di, di_end + 1, "clientCert", tmp, len + 1);
+        d->client_cert = str_dup(tmp);
+        jstr_range(di, di_end + 1, "clientKey", tmp, len + 1);
+        d->client_key = str_dup(tmp);
+        jstr_range(di, di_end + 1, "token", tmp, len + 1);
+        d->token = str_dup(tmp);
+        jstr_range(di, di_end + 1, "tenantMemberAccount", tmp, len + 1);
+        d->tenant_account = str_dup(tmp);
+
+        log_line("[%s] 连接桌面成功: host=%s port=%s clink=%s [来源:%s]",
+                 d->desktop_code,
+                 d->host ? d->host : "", d->port ? d->port : "",
+                 d->clink_host ? d->clink_host : "", info_keys[ki]);
+
+        /* 找到有效host就停止尝试下一个源 */
+        if (d->host && d->host[0]) break;
+
+        /* 当前源没有host，释放后尝试下一个 */
+        free(d->host); d->host = NULL;
+        free(d->port); d->port = NULL;
+        free(d->clink_host); d->clink_host = NULL;
+        free(d->ca_cert); d->ca_cert = NULL;
+        free(d->client_cert); d->client_cert = NULL;
+        free(d->client_key); d->client_key = NULL;
+        free(d->token); d->token = NULL;
+        free(d->tenant_account); d->tenant_account = NULL;
+    }
     if (!d->host || !d->host[0]) {
         log_line("[%s] 错误: 连接响应缺少host字段", d->desktop_code);
         free(d->host); d->host = NULL;
@@ -3658,6 +3703,8 @@ static int ws_connect(const char *uri, WSConn *wsc, const char *desktop_code) {
     if (colon) { *colon = 0; port = atoi(colon + 1); }
     if (use_ssl && port == 80) port = 443;
 
+    log_line("[%s] [DEBUG] ws_connect uri=%s host=%s port=%d ssl=%d", desktop_code, uri, host, port, use_ssl);
+
     /* 创建WinHTTP会话 */
     wsc->hSession = WinHttpOpen(L"CtYunKeepAlive/" APP_VERSION, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -3799,6 +3846,36 @@ static int ws_recv(WSConn *wsc, uint8_t *out, size_t outsz, int *is_text) {
 }
 
 /**
+ * ws_recv_polling - 带超时容错的接收
+ *
+ * 使用 ws_recv 接收数据，但将超时类错误视为"暂无数据"(返回0)，
+ * 而非连接断开。这样保活循环可以定期回到 timer 检查逻辑发送ping/mouse。
+ *
+ * 注意: WinHttpQueryDataAvailable 不支持WebSocket句柄(error 12018)，
+ *       因此直接使用 ws_recv + 超时错误容错的方式。
+ *
+ * @return  >0 收到字节数, 0 无数据/超时, -1 连接关闭或严重错误
+ */
+static int ws_recv_polling(WSConn *wsc, uint8_t *out, size_t outsz, int *is_text) {
+    int n = ws_recv(wsc, out, outsz, is_text);
+    if (n < 0) {
+        DWORD err = GetLastError();
+        /* 以下错误视为"暂时无数据"，返回0让循环继续检查timer */
+        if (err == ERROR_WINHTTP_TIMEOUT ||
+            err == ERROR_WINHTTP_OPERATION_CANCELLED ||
+            err == ERROR_IO_PENDING ||
+            err == 12018 ||  /* ERROR_INTERNET_INVALID_OPERATION */
+            err == 0) {       /* 有时GetLastError()在成功路径后为0 */
+            return 0;
+        }
+        /* 其他错误: 连接真正断开 */
+        log_line("[DEBUG] ws_recv致命错误 code=%lu", err);
+        return -1;
+    }
+    return n;
+}
+
+/**
  * ws_close - 关闭WebSocket连接
  *
  * 按正确顺序关闭所有句柄，释放资源。
@@ -3813,6 +3890,70 @@ static void ws_close(WSConn *wsc) {
     if (wsc->hRequest) WinHttpCloseHandle(wsc->hRequest);
     if (wsc->hConnect) WinHttpCloseHandle(wsc->hConnect);
     if (wsc->hSession) WinHttpCloseHandle(wsc->hSession);
+}
+
+/**
+ * ws_send_ping - 发送RFC 6455协议层WebSocket Ping帧
+ *
+ * 使用WinHTTP原生Ping控制帧(opcode=0x9)，与浏览器自动处理的行为一致。
+ * 服务端收到Ping后会自动回复Pong，证明连接活跃。
+ */
+static int ws_send_ping(WSConn *wsc) {
+    /*
+     * WinHTTP支持真正的WebSocket协议层Ping帧:
+     *   WINHTTP_WEB_SOCKET_PING_BUFFER_TYPE = 3 (opcode 0x9)
+     *
+     * 根据RFC 6455:
+     *   - 服务端收到Ping后必须回复Pong(相同payload)
+     *   - 这是浏览器自动处理的机制，我们的C程序需要显式调用
+     */
+    static const uint8_t ping_payload[4] = { 'A','L','I','V' };
+    DWORD err = WinHttpWebSocketSend(wsc->hWebSocket,
+                                     WINHTTP_WEB_SOCKET_PING_BUFFER_TYPE,
+                                     (void *)ping_payload, sizeof(ping_payload));
+    return (err == ERROR_SUCCESS) ? 0 : -1;
+}
+
+/**
+ * build_mouse_move_msg - 构建CLink鼠标移动事件消息
+ *
+ * 使用SendInfo协议格式封装鼠标位置更新，模拟真实用户操作。
+ * 消息格式: [2B type=201] [4B total_len] [4B x] [4B y] [1B buttons]
+ *
+ * @param out   输出缓冲区(至少15字节)
+ * @param osz   缓冲区大小
+ * @return      消息长度，失败返回0
+ */
+static size_t build_mouse_move_msg(uint8_t *out, size_t osz) {
+    if (osz < 15) return 0;
+
+    /* 随机小偏移坐标(100-300范围)，模拟轻微鼠标抖动 */
+    int mx = 100 + (rand() % 200);
+    int my = 100 + (rand() % 200);
+
+    /* SendInfo格式: type=201(CLINK_MSG_MOUSE_MOVE), data=9字节 */
+    uint16_t msg_type = 201;
+    uint32_t total_len = 6 + 9;  /* 6字节头 + 9字节数据 */
+
+    out[0]  = (uint8_t)(msg_type & 0xFF);
+    out[1]  = (uint8_t)((msg_type >> 8) & 0xFF);
+    out[2]  = (uint8_t)(total_len & 0xFF);
+    out[3]  = (uint8_t)((total_len >> 8) & 0xFF);
+    out[4]  = (uint8_t)((total_len >> 16) & 0xFF);
+    out[5]  = (uint8_t)((total_len >> 24) & 0xFF);
+
+    /* 鼠标数据: x(4B LE) + y(4B LE) + button_state(1B=0无按键) */
+    out[6]  = (uint8_t)(mx & 0xFF);
+    out[7]  = (uint8_t)((mx >> 8) & 0xFF);
+    out[8]  = (uint8_t)((mx >> 16) & 0xFF);
+    out[9]  = (uint8_t)((mx >> 24) & 0xFF);
+    out[10] = (uint8_t)(my & 0xFF);
+    out[11] = (uint8_t)((my >> 8) & 0xFF);
+    out[12] = (uint8_t)((my >> 16) & 0xFF);
+    out[13] = (uint8_t)((my >> 24) & 0xFF);
+    out[14] = 0;  /* 无按键按下 */
+
+    return 15;
 }
 
 /* ======================== SendInfo协议解析 ======================== */
@@ -3929,6 +4070,74 @@ typedef struct {
 } MonitorParam;
 
 /**
+ * HeartbeatParam - 心跳线程参数
+ *
+ * 共享WSConn指针，心跳线程负责定时发送ping/mouse，
+ * 主线程负责阻塞接收消息。两者操作同一WebSocket句柄。
+ */
+typedef struct {
+    WSConn *wsc;                  /* 共享的WebSocket连接(用于发送/关闭) */
+    const char *desktop_code;     /* 桌面编码(用于日志) */
+    volatile LONG *stop_flag;     /* 停止标志(由主线程设置) */
+    DWORD cycle_start;            /* 本周期开始时间(GetTickCount) */
+    HINTERNET hWebSocket;         /* WebSocket句柄(用于关闭) */
+    volatile LONG *close_done;    /* 互斥标志，防止重复关闭 */
+} HeartbeatParam;
+
+/**
+ * heartbeat_thread - 定时发送协议层Ping，并在周期结束前主动关闭连接
+ *
+ * 核心策略:
+ *   - 每15秒发送RFC 6455 Ping帧(检测WebSocket层活性)
+ *   - 在WS_KEEPALIVE_MS到期时WinHttpWebSocketClose主动断连
+ *   - 抢在服务端zombie检测(60s)之前完成一次"优雅重连"
+ *   - 本质: 通过高频率连接/断开模拟真实客户端的活跃行为
+ *
+ * @param param  HeartbeatParam指针
+ * @return       线程退出码(0)
+ */
+static DWORD WINAPI heartbeat_thread(LPVOID param) {
+    HeartbeatParam *hp = (HeartbeatParam *)param;
+    DWORD last_ping = GetTickCount();
+    int should_close = 0;
+
+    while (!InterlockedCompareExchange(hp->stop_flag, 0, 0)) {
+        Sleep(5000);  /* 每5秒检查一次 */
+        if (InterlockedCompareExchange(hp->stop_flag, 0, 0)) break;
+
+        DWORD now = GetTickCount();
+        DWORD elapsed = now - hp->cycle_start;
+
+        /* 在WS_KEEPALIVE_MS到期时主动关闭连接，抢在zombie之前重连 */
+        if (elapsed >= WS_KEEPALIVE_MS && !InterlockedCompareExchange(hp->close_done, 0, 0)) {
+            InterlockedExchange(hp->close_done, 1);
+            should_close = 1;
+            log_line("[%s] [CYCLE] 周期%ds到期，主动关闭连接(避免zombie)", hp->desktop_code, elapsed / 1000);
+            break;
+        }
+
+        /* 发送RFC 6455协议层Ping帧(opcode=0x9) */
+        if ((now - last_ping) >= WS_PING_INTERVAL_MS) {
+            if (ws_send_ping(hp->wsc) == 0)
+                log_line("[%s] [PING] RFC6455-Ping已发送 (+%ds)", hp->desktop_code, elapsed / 1000);
+            else {
+                log_line("[%s] [PING] RFC6455-Ping发送失败 (+%ds)", hp->desktop_code, elapsed / 1000);
+                should_close = 1;
+                break;
+            }
+            last_ping = now;
+        }
+    }
+
+    /* 主动关闭WebSocket，解除主线程ws_recv的阻塞 */
+    if (should_close && hp->hWebSocket) {
+        log_line("[%s] [CYCLE] 正在关闭WebSocket连接...", hp->desktop_code);
+        WinHttpWebSocketClose(hp->hWebSocket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
+    }
+    return 0;
+}
+
+/**
  * keep_alive_thread - 保活工作线程
  *
  * 对运行中的桌面执行WebSocket保活:
@@ -4009,37 +4218,158 @@ static DWORD WINAPI keep_alive_thread(LPVOID param) {
         InterlockedExchange(&s_retry_count, 0);
 
         ws_send_text(&wsc, d->connect_msg);
+        log_line("[%s] [DEBUG] connect_msg已发送(%dB)", d->desktop_code, (int)strlen(d->connect_msg));
         Sleep(WS_SEND_DELAY_MS);
         ws_send_bytes(&wsc, initial_payload, sizeof(initial_payload));
+        log_line("[%s] [DEBUG] REDQ initial_payload已发送(%zuB)", d->desktop_code, sizeof(initial_payload));
         user_payload_sent = 0;
 
-        log_line("[%s] 已连接，保持60秒", d->desktop_code);
+        log_line("[%s] 已连接，保持%d秒", d->desktop_code, WS_KEEPALIVE_MS / 1000);
 
+        /* [修复] 启动协议层Ping心跳线程(RFC 6455 opcode 0x9) + 周期结束主动关闭 */
+        volatile LONG hb_stop = 0;
+        volatile LONG hb_close_done = 0;
+        HeartbeatParam hb_param = { &wsc, d->desktop_code, &hb_stop, GetTickCount(), wsc.hWebSocket, &hb_close_done };
+        HANDLE hHeartbeat = CreateThread(NULL, 0, heartbeat_thread, &hb_param, 0, NULL);
+        if (!hHeartbeat) {
+            log_line("[%s] 警告: 心跳线程创建失败，将使用单线程模式", d->desktop_code);
+        }
+
+        /* 主线程: 阻塞接收消息，处理REDQ认证/用户身份等协议交互 */
         DWORD start = GetTickCount();
+
+        /* [协议分析] 记录本周期内见过的所有SendInfo类型(只记录首次) */
+        uint16_t seen_types[64] = {0};
+        int seen_type_count = 0;
+
+        /*
+         * 回复缓冲: 只收集必须回复的协议消息(type=103用户身份)。
+         * type=4心跳暂不回显，观察纯被动模式的存活时间。
+         */
+        uint8_t reply_buf[4096];
+        size_t  reply_len = 0;
+
         while (g_running && (GetTickCount() - start) < WS_KEEPALIVE_MS) {
             int is_text;
             int n = ws_recv(&wsc, ws_buf, WS_RECV_BUF_SIZE, &is_text);
-            if (n < 0) break;
+            if (n < 0) {
+                DWORD err = GetLastError();
+                log_line("[%s] [DEBUG] 接收错误/连接关闭 (err=%lu), 断开重连", d->desktop_code, err);
+                break;
+            }
             if (n == 0) continue;
+
+            /* 重置本批次的回复缓冲 */
+            reply_len = 0;
+
             if (!is_text && n >= 4 && memcmp(ws_buf, "REDQ", 4) == 0) {
-                log_line("[%s] 收到REDQ认证请求", d->desktop_code);
+                /* REDQ认证请求 */
+                log_line("[%s] 收到REDQ认证请求(%dB)", d->desktop_code, n);
                 uint8_t resp[512]; size_t rlen = 0;
                 if (handle_redq(ws_buf, n, resp, &rlen)) {
                     ws_send_bytes(&wsc, resp, rlen);
-                    log_line("[%s] REDQ认证响应成功", d->desktop_code);
+                    log_line("[%s] [DEBUG] REDQ认证响应成功, rlen=%zu", d->desktop_code, rlen);
+                } else {
+                    log_line("[%s] [ERROR] REDQ handle_redq处理失败!", d->desktop_code);
                 }
-            } else if (!is_text && n >= 6 && user_payload_len > 0 && !user_payload_sent) {
-                /* 收到CLINK_MSG_MAIN_INIT(type=103): 服务端要求客户端发送用户身份 */
-                if (has_send_info_type(ws_buf, (size_t)n, 103)) {
-                    ws_send_bytes(&wsc, user_payload_buf, user_payload_len);
-                    log_line("[%s] 发送用户身份响应", d->desktop_code);
-                    user_payload_sent = 1;
+            } else if (!is_text && n >= 6) {
+                /*
+                 * [协议处理] 解析所有SendInfo二进制消息
+                 * 关键发现: type=4 是服务端心跳包(12B)，必须回显才能避免zombie
+                 */
+                size_t off = 0;
+                while (off + 6 <= (size_t)n) {
+                    uint16_t msg_type = (uint16_t)(ws_buf[off] | (ws_buf[off+1] << 8));
+                    int32_t msg_dlen = (int32_t)(ws_buf[off+2] | (ws_buf[off+3]<<8) |
+                                                (ws_buf[off+4]<<16) | (ws_buf[off+5]<<24));
+                    if (msg_dlen < 0 || off + 6 + (size_t)msg_dlen > (size_t)n) break;
+
+                    /* 检查是否已记录过此类型 */
+                    int already_seen = 0;
+                    for (int si = 0; si < seen_type_count; si++) {
+                        if (seen_types[si] == msg_type) { already_seen = 1; break; }
+                    }
+
+                    /* [测试] 纯被动模式: 不回复任何消息，观察最长存活时间 */
+                    if (msg_type == 4 && msg_dlen >= 12) {
+                        if (!already_seen) {
+                            char hex[64] = {0};
+                            int hmax = msg_dlen < 16 ? msg_dlen : 16;
+                            for (int hi = 0; hi < hmax; hi++)
+                                snprintf(hex + hi*3, 4, "%02x", ws_buf[off+6+hi]);
+                            log_line("[%s] [HEARTBEAT] type=%u len=%d hex=[%s] [纯被动]",
+                                     d->desktop_code, msg_type, msg_dlen, hex);
+                            if (seen_type_count < 64) seen_types[seen_type_count++] = msg_type;
+                        }
+                    }
+                    /* type=103: 用户身份请求 → 需要回复用户信息 */
+                    else if (msg_type == 103 && user_payload_len > 0 && !user_payload_sent) {
+                        if (reply_len + user_payload_len <= sizeof(reply_buf)) {
+                            memcpy(reply_buf + reply_len, user_payload_buf, user_payload_len);
+                            reply_len += user_payload_len;
+                        }
+                        log_line("[%s] 发送用户身份响应(type=103)", d->desktop_code);
+                        user_payload_sent = 1;
+                        if (!already_seen && seen_type_count < 64)
+                            seen_types[seen_type_count++] = msg_type;
+                    }
+                    /* type=0: 空消息 → 不回复(服务端→客户端单向) */
+                    else if (msg_type == 0) {
+                        if (!already_seen) {
+                            log_line("[%s] [PROTO] type=0 空消息(不回复)", d->desktop_code);
+                            if (seen_type_count < 64) seen_types[seen_type_count++] = msg_type;
+                        }
+                    }
+                    /* type=127: 屏幕帧数据 → 不回复(服务端→客户端单向，回显会导致连接断开!) */
+                    else if (msg_type == 127) {
+                        if (!already_seen) {
+                            log_line("[%s] [PROTO] type=127 屏幕数据 %dB(不回复)", d->desktop_code, msg_dlen);
+                            if (seen_type_count < 64) seen_types[seen_type_count++] = msg_type;
+                        }
+                    }
+                    /* 其他未知类型: 首次记录 */
+                    else {
+                        if (!already_seen && seen_type_count < 64) {
+                            seen_types[seen_type_count++] = msg_type;
+                            log_line("[%s] [PROTO] 新类型 type=%u data_len=%d", d->desktop_code, msg_type, msg_dlen);
+                        }
+                    }
+
+                    off += 6 + (size_t)msg_dlen;
                 }
+
+                /* ★ 批量发送本批次收集的所有回复(在recv循环外发送，避免状态机冲突) ★ */
+                if (reply_len > 0) {
+                    ws_send_bytes(&wsc, reply_buf, reply_len);
+                    log_line("[%s] [BATCH] 批量回复 %zuB", d->desktop_code, reply_len);
+                }
+            } else if (is_text) {
+                log_line("[%s] [DEBUG] 收到文本消息(%dB): %.256s", d->desktop_code, n, ws_buf);
+            } else if (n > 0) {
+                log_line("[%s] [DEBUG] 其他小包 is_text=%d n=%d", d->desktop_code, is_text, n);
             }
         }
 
+        /* 本周期结束: 打印汇总的所有协议类型 */
+        if (seen_type_count > 0) {
+            char type_list[512] = {0};
+            int pos = 0;
+            for (int ti = 0; ti < seen_type_count && pos < 500; ti++) {
+                pos += snprintf(type_list + pos, 500 - pos, "%u ", seen_types[ti]);
+            }
+            log_line("[%s] [PROTO-SUMMARY] 本周期共发现 %d 种SendInfo类型: %s",
+                     d->desktop_code, seen_type_count, type_list);
+        }
+
+        /* 停止心跳线程并等待退出 */
+        InterlockedExchange(&hb_stop, 1);
+        if (hHeartbeat) {
+            WaitForSingleObject(hHeartbeat, 3000);  /* 等待最多3秒 */
+            CloseHandle(hHeartbeat);
+        }
+
         ws_close(&wsc);
-        log_line("[%s] 60秒完成，重新连接", d->desktop_code);
+        log_line("[%s] %d秒完成，重新连接", d->desktop_code, WS_KEEPALIVE_MS / 1000);
 
         /* 全局原子计数器每15次递增时执行一次trim，释放物理内存 */
         if (InterlockedIncrement(&g_trim_counter) % 15 == 0) trim_working_set(0);
