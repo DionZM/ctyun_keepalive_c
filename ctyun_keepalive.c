@@ -6069,6 +6069,10 @@ static void usage(const char *exe) {
  * 10. 清理资源并退出
  */
 int main(int argc, char *argv[]) {
+    /* 设置控制台为UTF-8编码，解决中文乱码（必须在 printf/usage 之前） */
+    SetConsoleOutputCP(65001);
+    SetConsoleCP(65001);
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "/background") == 0 || strcmp(argv[i], "/b") == 0) {
             g_bg_switch = 1;
@@ -6094,9 +6098,6 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* 设置控制台为UTF-8编码，解决中文乱码 */
-    SetConsoleOutputCP(65001);
-    SetConsoleCP(65001);
     /* 设置控制台字体为Consolas，确保中文正常显示 */
     CONSOLE_FONT_INFOEX cfi = {0};
     cfi.cbSize = sizeof(cfi);
