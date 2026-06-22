@@ -1420,6 +1420,94 @@ static int http_get_via_curl(const char *url, const char **hdrs, int nhdrs,
 }
 
 /**
+ * http_get_with_winhttp - 用 WinHTTP 发起 GET 并提取 Location 头
+ *
+ * 用于 cas/login 方案 2：把 query 里的 service 值改成不含 "//" 的形式，
+ * 绕过 WinHTTP 对 URL 中连续双斜杠的规范化（它会把 query 里的 // 当成路径分隔）。
+ *
+ * @param url          完整URL（调用方需保证 scheme/host/path/query 合法）
+ * @param hdrs         请求头数组
+ * @param nhdrs        请求头数量
+ * @param cookies_in   请求Cookie串
+ * @param resp         响应缓冲（头+体）
+ * @param rsz          响应缓冲大小
+ * @param status_out   输出HTTP状态码
+ * @param location_out 输出Location头
+ * @param loc_sz       location缓冲大小
+ * @return             响应（头+体）长度，失败返回-1
+ */
+static int http_get_with_winhttp(const char *url, const char **hdrs, int nhdrs,
+                                  const char *cookies_in,
+                                  char *resp, size_t rsz,
+                                  int *status_out,
+                                  char *location_out, size_t loc_sz) {
+    URL_COMPONENTS uc = {0};
+    uc.dwStructSize = sizeof(uc);
+    WCHAR whostname[256], wurl_path[2048];
+    uc.lpszHostName = whostname; uc.dwHostNameLength = sizeof(whostname)/sizeof(WCHAR);
+    uc.lpszUrlPath = wurl_path; uc.dwUrlPathLength = sizeof(wurl_path)/sizeof(WCHAR);
+    WCHAR wurl[4096];
+    MultiByteToWideChar(CP_ACP, 0, url, -1, wurl, 4096);
+    if (!WinHttpCrackUrl(wurl, 0, 0, &uc)) return -1;
+
+    HINTERNET hconn = WinHttpConnect(g_inet, whostname, (INTERNET_PORT)uc.nPort, 0);
+    if (!hconn) return -1;
+    DWORD flags = WINHTTP_FLAG_REFRESH | WINHTTP_FLAG_ESCAPE_DISABLE_QUERY;
+    if (uc.nScheme == INTERNET_SCHEME_HTTPS) flags |= WINHTTP_FLAG_SECURE;
+    HINTERNET hreq = WinHttpOpenRequest(hconn, L"GET", wurl_path, NULL, WINHTTP_NO_REFERER,
+                                         WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!hreq) { WinHttpCloseHandle(hconn); return -1; }
+    if (uc.nScheme == INTERNET_SCHEME_HTTPS) {
+        DWORD opt = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+                    SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+        WinHttpSetOption(hreq, WINHTTP_OPTION_SECURITY_FLAGS, &opt, sizeof(opt));
+    }
+    for (int i = 0; i < nhdrs; i++) {
+        WCHAR whdr[512];
+        MultiByteToWideChar(CP_ACP, 0, hdrs[i], -1, whdr, 512);
+        WinHttpAddRequestHeaders(hreq, whdr, (ULONG)-1, WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+    }
+    if (cookies_in && cookies_in[0]) {
+        char h[2048]; snprintf(h, sizeof(h), "Cookie: %s", cookies_in);
+        WCHAR wh[2048]; MultiByteToWideChar(CP_ACP, 0, h, -1, wh, 2048);
+        WinHttpAddRequestHeaders(hreq, wh, (ULONG)-1, WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+    }
+
+    if (!WinHttpSendRequest(hreq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, NULL, 0, 0, 0)) {
+        WinHttpCloseHandle(hreq); WinHttpCloseHandle(hconn); return -1;
+    }
+    if (!WinHttpReceiveResponse(hreq, NULL)) {
+        WinHttpCloseHandle(hreq); WinHttpCloseHandle(hconn); return -1;
+    }
+
+    /* 状态码 */
+    DWORD status_code = 0, sc_len = sizeof(status_code);
+    WinHttpQueryHeaders(hreq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, NULL, &status_code, &sc_len, NULL);
+    if (status_out) *status_out = (int)status_code;
+
+    /* Location 头 */
+    if (location_out && loc_sz > 0) {
+        location_out[0] = 0;
+        WCHAR wloc[1024];
+        DWORD loc_len = sizeof(wloc);
+        if (WinHttpQueryHeaders(hreq, WINHTTP_QUERY_LOCATION, WINHTTP_HEADER_NAME_BY_INDEX,
+                                wloc, &loc_len, WINHTTP_NO_HEADER_INDEX)) {
+            WideCharToMultiByte(CP_ACP, 0, wloc, -1, location_out, (int)loc_sz, NULL, NULL);
+        }
+    }
+
+    DWORD total = 0, n;
+    while (total < rsz - 1 && WinHttpReadData(hreq, resp + total, (DWORD)(rsz - 1 - total), &n) && n > 0) {
+        total += n;
+    }
+    resp[total] = 0;
+
+    WinHttpCloseHandle(hreq);
+    WinHttpCloseHandle(hconn);
+    return (int)total;
+}
+
+/**
  * http_read_sse - 读取SSE流式响应直至结束
  *
  * eaichat chat/completions 返回 text/event-stream，数据以 "data: ...\n\n" 分块。
@@ -4710,9 +4798,12 @@ static int chat_login(ChatSession *cs, const char *user, const char *pwd_sha) {
 
         /* 构造 cas/login URL(带service参数) */
         char cas_url[512];
+        /* 方案2：service 值改用不含 "//" 的形式，绕过 WinHTTP URL 规范化。
+         * 原值 https://eaichat... 中的双斜杠会让 WinHTTP 把 query 截断。
+         * 这里用 https:/eaichat...（单斜杠），服务端若做 URL 规范化应能识别。 */
         snprintf(cas_url, sizeof(cas_url),
                  "https://desk.ctyun.cn/cloudB/dy/iam/api/auth/iam/cas/login"
-                 "?service=https%%3A%%2F%%2Feaichat.ctyun.cn%%3A443%%2Fchat%%2F%%23%%2Faichat");
+                 "?service=https:/eaichat.ctyun.cn:443/chat/%%23/aichat");
 
         const char *cas_hdrs[8] = {
             "accept: application/json, text/plain, */*",
@@ -4725,12 +4816,22 @@ static int chat_login(ChatSession *cs, const char *user, const char *pwd_sha) {
         char cas_resp[4096];
         int cas_status = 0;
         char location[1024] = "";
-        /* [TODO 临时方案] cas/login 用 curl.exe 而非 WinHTTP，
-         * 因为该URL的query含 "//" 会触发WinHTTP的URL规范化bug，
-         * 破坏请求路径。详见 http_get_via_curl 注释和 TODO.md。 */
-        int crlen = http_get_via_curl(cas_url, cas_hdrs, 4,
+        /* 先尝试 WinHTTP 方案 2 */
+        log_line("[eaichat] cas/login 尝试 WinHTTP 方案 2(单斜杠 service)...");
+        int crlen = http_get_with_winhttp(cas_url, cas_hdrs, 4,
+                                           cs->cookies,
+                                           cas_resp, sizeof(cas_resp),
+                                           &cas_status, location, sizeof(location));
+        if (cas_status != 302 || !location[0]) {
+            log_line("[eaichat] WinHTTP 方案 2 失败(status=%d)，回退到 curl.exe", cas_status);
+            /* 回退时仍用原双斜杠 URL，curl.exe 不做 WinHTTP 规范化 */
+            snprintf(cas_url, sizeof(cas_url),
+                     "https://desk.ctyun.cn/cloudB/dy/iam/api/auth/iam/cas/login"
+                     "?service=https%%3A%%2F%%2Feaichat.ctyun.cn%%3A443%%2Fchat%%2F%%23%%2Faichat");
+            crlen = http_get_via_curl(cas_url, cas_hdrs, 4,
                                        cs->cookies, NULL, 0,
                                        cas_resp, sizeof(cas_resp), &cas_status, location, sizeof(location));
+        }
         log_line("[eaichat] cas/login status=%d", cas_status);
         (void)crlen;
         if (cas_status != 302 || !location[0]) {
