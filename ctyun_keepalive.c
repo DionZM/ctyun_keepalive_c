@@ -637,8 +637,21 @@ static char *jstr(const char *j, const char *k, char *buf, size_t bsz) {
     /* 提取字符串值，处理转义字符 */
     size_t i = 0;
     while (*p && *p != '"' && i < bsz - 1) {
-        if (*p == '\\' && *(p + 1)) p++;  /* 跳过转义符，取下一个字符 */
-        buf[i++] = *p++;
+        if (*p == '\\' && *(p + 1)) {
+            p++;
+            switch (*p) {
+                case 'n': buf[i++] = '\n'; break;
+                case 't': buf[i++] = '\t'; break;
+                case 'r': buf[i++] = '\r'; break;
+                case '"': buf[i++] = '"';  break;
+                case '\\': buf[i++] = '\\'; break;
+                case '/': buf[i++] = '/';  break;
+                default:  buf[i++] = *p;   break;
+            }
+            p++;
+        } else {
+            buf[i++] = *p++;
+        }
     }
     buf[i] = 0;
     return buf;
@@ -704,8 +717,21 @@ static char *jstr_range(const char *start, const char *end, const char *k, char 
     p++;
     size_t i = 0;
     while (p < end && *p && *p != '"' && i < bsz - 1) {
-        if (*p == '\\' && (p + 1) < end) p++;
-        buf[i++] = *p++;
+        if (*p == '\\' && (p + 1) < end) {
+            p++;
+            switch (*p) {
+                case 'n': buf[i++] = '\n'; break;
+                case 't': buf[i++] = '\t'; break;
+                case 'r': buf[i++] = '\r'; break;
+                case '"': buf[i++] = '"';  break;
+                case '\\': buf[i++] = '\\'; break;
+                case '/': buf[i++] = '/';  break;
+                default:  buf[i++] = *p;   break;
+            }
+            p++;
+        } else {
+            buf[i++] = *p++;
+        }
     }
     buf[i] = 0;
     return buf;
@@ -5957,16 +5983,187 @@ static BOOL WINAPI ctrl_handler(DWORD type) {
 
 /* ---- eaichat 对话线程与调度 ---- */
 
-/* 每日对话的预设消息(随机选一条) */
-static const char *CHAT_PRESET[] = {
-    "\xe4\xbb\x8a\xe5\xa4\xa9\xe5\x8c\x97\xe4\xba\xac\xe5\xa4\xa9\xe6\xb0\x94\xe6\x80\x8e\xe4\xb9\x88\xe6\xa0\xb7\xef\xbc\x9f\xef\xbc\x88\xe7\xae\x80\xe7\x9f\xad\xe5\x9b\x9e\xe7\xad\x94\xef\xbc\x89",
-    "\xe7\xbb\x99\xe6\x88\x91\xe8\xae\xb2\xe4\xb8\x80\xe4\xb8\xaa\xe5\x86\xb7\xe7\xac\x91\xe8\xaf\x9d\xe3\x80\x82\xef\xbc\x88\xe7\xae\x80\xe7\x9f\xad\xe5\x9b\x9e\xe7\xad\x94\xef\xbc\x89",
-    "\xe6\x9d\xa5\xe4\xb8\x80\xe9\xa6\x96\xe5\x8f\xa4\xe8\xaf\x97\xe3\x80\x82\xef\xbc\x88\xe7\xae\x80\xe7\x9f\xad\xe5\x9b\x9e\xe7\xad\x94\xef\xbc\x89",
-    "\xe7\xa9\xba\xe8\x85\xb9\xe5\x8f\xaf\xe4\xbb\xa5\xe5\x90\x83\xe9\xa5\xad\xe5\x90\x97\xef\xbc\x9f\xef\xbc\x88\xe7\xae\x80\xe7\x9f\xad\xe5\x9b\x9e\xe7\xad\x94\xef\xbc\x89",
-    "\xe6\x8e\xa8\xe8\x8d\x90\xe4\xb8\x80\xe9\x83\xa8\xe4\xba\xba\xe7\x94\x9f\xe5\xbf\x85\xe7\x9c\x8b\xe7\x94\xb5\xe5\xbd\xb1\xe3\x80\x82\xef\xbc\x88\xe7\xae\x80\xe7\x9f\xad\xe5\x9b\x9e\xe7\xad\x94\xef\xbc\x89",
-    "1+1\xe7\xad\x89\xe4\xba\x8e\xe5\x87\xa0\xef\xbc\x9f\xef\xbc\x88\xe7\xae\x80\xe7\x9f\xad\xe5\x9b\x9e\xe7\xad\x94\xef\xbc\x89",
-};
-#define CHAT_PRESET_COUNT (sizeof(CHAT_PRESET)/sizeof(CHAT_PRESET[0]))
+/* 问题列表文件名(与exe同目录) */
+#define QUESTIONS_FILE "questions.txt"
+/* 生成问题的提示词 */
+#define QUESTIONS_PROMPT "\xe9\x9a\x8f\xe6\x9c\xba\xe8\xbe\x93\xe5\x87\xba" "300\xe4\xb8\xaa\xe5\xb8\xb8\xe8\xaf\x86\xe9\x97\xae\xe9\xa2\x98\xef\xbc\x8c\xe6\xa0\xbc\xe5\xbc\x8f\xe4\xb8\xba\xe6\xaf\x8f\xe8\xa1\x8c\xe4\xb8\x80\xe4\xb8\xaa\xe9\x97\xae\xe9\xa2\x98\xef\xbc\x8c\xe4\xb8\x8d\xe5\x8a\xa0\xe5\xba\x8f\xe5\x8f\xb7\xef\xbc\x8c\xe5\x8f\xaa\xe8\xbe\x93\xe5\x87\xba\xe9\x97\xae\xe9\xa2\x98\xe6\x9c\xac\xe8\xba\xab\xef\xbc\x88\xe5\x90\xab\xe6\xa0\x87\xe7\x82\xb9\xe7\xac\xa6\xe5\x8f\xb7\xef\xbc\x89\xe3\x80\x82"
+
+/**
+ * get_questions_path - 获取 questions.txt 的完整路径
+ */
+static void get_questions_path(char *out, size_t outsz) {
+    char exe_path[MAX_PATH];
+    GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+    char *slash = strrchr(exe_path, '\\');
+    if (slash) *slash = 0;
+    snprintf(out, outsz, "%s\\%s", exe_path, QUESTIONS_FILE);
+}
+
+/**
+ * generate_questions - 向AI请求生成300个常识问题，保存到 questions.txt
+ *
+ * @return 1=成功, 0=失败
+ */
+static int generate_questions(void) {
+    char qpath[MAX_PATH];
+    get_questions_path(qpath, sizeof(qpath));
+
+    log_line("[eaichat] 问题列表不存在，向AI请求生成300个常识问题...");
+
+    char reply[65536];
+    int send_ok = chat_send_message(&g_chat, QUESTIONS_PROMPT, reply, sizeof(reply), "");
+    if (!send_ok) {
+        log_line("[eaichat] 生成问题列表失败(AI未回复)");
+        return 0;
+    }
+
+    /* 将AI回复按行拆分写入 questions.txt */
+    FILE *f = fopen(qpath, "w");
+    if (!f) {
+        log_line("[eaichat] 无法写入 %s", qpath);
+        return 0;
+    }
+
+    int count = 0;
+    const char *p = reply;
+    while (*p) {
+        /* 跳过行首换行 */
+        while (*p == '\r' || *p == '\n') p++;
+        if (!*p) break;
+
+        /* 提取一行 */
+        const char *start = p;
+        while (*p && *p != '\r' && *p != '\n') p++;
+        size_t line_len = (size_t)(p - start);
+
+        /* 去除行尾空白 */
+        while (line_len > 0 && (start[line_len-1] == ' ' || start[line_len-1] == '\t'))
+            line_len--;
+
+        /* 跳过空行 */
+        if (line_len == 0) continue;
+
+        /* 跳过序号前缀(如 "1." "23. " "1、" 等) */
+        const char *wp = start;
+        size_t wlen = line_len;
+        if (wlen >= 2 && wp[0] >= '0' && wp[0] <= '9') {
+            const char *dp = wp;
+            while (dp < wp + wlen && *dp >= '0' && *dp <= '9') dp++;
+            if (dp < wp + wlen && *dp == '.') {
+                dp++;
+                while (dp < wp + wlen && (*dp == ' ' || *dp == '\t')) dp++;
+                wp = dp;
+                wlen = (size_t)(start + line_len - wp);
+            } else if (dp + 2 < wp + wlen && dp[0] == '\xe3' && dp[1] == '\x80' && dp[2] == '\x81') {
+                /* UTF-8 顿号 "、" = \xe3\x80\x81 */
+                dp += 3;
+                while (dp < wp + wlen && (*dp == ' ' || *dp == '\t')) dp++;
+                wp = dp;
+                wlen = (size_t)(start + line_len - wp);
+            }
+        }
+
+        if (wlen == 0) continue;
+        fwrite(wp, 1, wlen, f);
+        fputc('\n', f);
+        count++;
+    }
+    fclose(f);
+    log_line("[eaichat] 问题列表已生成(%d个问题)", count);
+    return count > 0;
+}
+
+/**
+ * pick_question - 从 questions.txt 随机取一个问题，并从文件中删除它
+ *
+ * @param out     输出问题文本
+ * @param outsz   输出缓冲区大小
+ * @return        1=成功取到问题, 0=无问题或读取失败
+ */
+static int pick_question(char *out, size_t outsz) {
+    char qpath[MAX_PATH];
+    get_questions_path(qpath, sizeof(qpath));
+
+    FILE *f = fopen(qpath, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    if (fsize <= 0) { fclose(f); return 0; }
+    fseek(f, 0, SEEK_SET);
+    char *content = (char *)malloc(fsize + 1);
+    if (!content) { fclose(f); return 0; }
+    size_t clen = fread(content, 1, fsize, f);
+    content[clen] = 0;
+    fclose(f);
+
+    /* 统计行数 */
+    int total_lines = 0;
+    const char *p = content;
+    while (*p) {
+        if (*p == '\n') total_lines++;
+        p++;
+    }
+    /* 最后一行可能无换行符 */
+    if (clen > 0 && content[clen-1] != '\n') total_lines++;
+    if (total_lines == 0) { free(content); return 0; }
+
+    /* 随机选一行 */
+    uint8_t rnd[4];
+    CryptGenRandom(g_crypt, 4, rnd);
+    uint32_t ridx = ((uint32_t)rnd[0] << 16) | ((uint32_t)rnd[1] << 8) | rnd[2];
+    int target = (int)(ridx % total_lines);
+
+    /* 找到目标行 */
+    int line_idx = 0;
+    const char *line_start = content;
+    const char *line_end = NULL;
+    p = content;
+    while (*p) {
+        if (*p == '\n') {
+            if (line_idx == target) {
+                line_end = p;
+                break;
+            }
+            line_idx++;
+            line_start = p + 1;
+        }
+        p++;
+    }
+    if (!line_end) {
+        /* 最后一行无换行符 */
+        if (line_idx == target) {
+            line_end = content + clen;
+        } else {
+            free(content);
+            return 0;
+        }
+    }
+
+    /* 提取问题文本(去行尾\r和空白) */
+    size_t qlen = (size_t)(line_end - line_start);
+    while (qlen > 0 && (line_start[qlen-1] == '\r' || line_start[qlen-1] == ' ' || line_start[qlen-1] == '\t'))
+        qlen--;
+    if (qlen == 0 || qlen >= outsz) { free(content); return 0; }
+    memcpy(out, line_start, qlen);
+    out[qlen] = 0;
+
+    /* 重写文件: 删除已选行 */
+    f = fopen(qpath, "w");
+    if (f) {
+        /* 写 target 之前的行 */
+        if (target > 0)
+            fwrite(content, 1, (size_t)(line_start - content), f);
+        /* 写 target 之后的行 */
+        if (*line_end == '\n')
+            fwrite(line_end + 1, 1, clen - (size_t)(line_end - content) - 1, f);
+        else
+            fwrite(line_end, 1, clen - (size_t)(line_end - content), f);
+        fclose(f);
+    }
+
+    free(content);
+    return 1;
+}
 
 /**
  * chat_param - 对话线程参数
@@ -6214,26 +6411,40 @@ static int chat_do_daily_task(ChatParam *cp) {
         save_chat_state();  /* 登录成功后持久化会话 */
     }
 
-    /* 随机选预设消息 */
-    uint8_t rnd;
-    CryptGenRandom(g_crypt, 1, &rnd);
-    const char *msg = CHAT_PRESET[rnd % CHAT_PRESET_COUNT];
+    /* 检查问题列表是否存在且有剩余问题 */
+    char question[1024];
+    if (!pick_question(question, sizeof(question))) {
+        /* 无问题或文件不存在，生成新列表 */
+        if (!generate_questions()) {
+            log_line("[eaichat] 生成问题列表失败，跳过本次对话");
+            return 0;
+        }
+        /* 生成后重新取问题 */
+        if (!pick_question(question, sizeof(question))) {
+            log_line("[eaichat] 问题列表仍为空，跳过本次对话");
+            return 0;
+        }
+    }
+
+    log_line("[eaichat] 提问: %s", question);
 
     char reply[4096];
-    int send_ok = chat_send_message(&g_chat, msg, reply, sizeof(reply), "");
+    int send_ok = chat_send_message(&g_chat, question, reply, sizeof(reply), "");
     if (!send_ok) {
         /* 可能cookie过期，重新登录再试一次 */
         log_line("[eaichat] 发送失败，尝试重新登录");
         g_chat.logged_in = 0;
         if (chat_login(&g_chat, cp->user, cp->password_sha)) {
             save_chat_state();  /* 重登后也持久化 */
-            if (chat_send_message(&g_chat, msg, reply, sizeof(reply), "")) {
+            if (chat_send_message(&g_chat, question, reply, sizeof(reply), "")) {
+                log_line("[eaichat] 回答: %s", reply);
                 log_line("[eaichat] 重登后对话成功");
                 return 1;
             }
         }
         return 0;
     }
+    log_line("[eaichat] 回答: %s", reply);
     return 1;
 }
 

@@ -11,6 +11,8 @@ bin/
 # Runtime files
 run.log
 config.json
+questions.txt
+chat_state.json
 
 # IDE files
 .vs/
