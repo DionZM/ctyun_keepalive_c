@@ -4184,26 +4184,68 @@ static int resolve_credentials(Session *s, char *out_user, char *out_pass_sha) {
             free(inner_json);
         }
 
+        /* 保留已有的 chat_dpapi 字段(避免覆盖 chat 会话状态) */
+        char chat_dpapi_val[32768] = "";
+        {
+            FILE *rf = fopen(config_path, "rb");
+            if (rf) {
+                fseek(rf, 0, SEEK_END);
+                long rfsz = ftell(rf);
+                if (rfsz > 0 && rfsz < 1024 * 1024) {
+                    fseek(rf, 0, SEEK_SET);
+                    char *rold = (char *)malloc(rfsz + 1);
+                    if (rold) {
+                        size_t rrd = fread(rold, 1, rfsz, rf);
+                        rold[rrd] = 0;
+                        const char *cdp = strstr(rold, "\"chat_dpapi\"");
+                        if (cdp) {
+                            cdp += strlen("\"chat_dpapi\"");
+                            while (*cdp == ' ' || *cdp == ':') cdp++;
+                            if (*cdp == '"') {
+                                cdp++;
+                                const char *cdpe = strchr(cdp, '"');
+                                if (cdpe) {
+                                    size_t vlen = (size_t)(cdpe - cdp);
+                                    if (vlen < sizeof(chat_dpapi_val)) {
+                                        memcpy(chat_dpapi_val, cdp, vlen);
+                                        chat_dpapi_val[vlen] = 0;
+                                    }
+                                }
+                            }
+                        }
+                        free(rold);
+                    }
+                }
+                fclose(rf);
+            }
+        }
+
         f = fopen(config_path, "w");
         if (f) {
+            /* 构造 chat_dpapi 片段(若有) */
+            char chat_dpapi_field[32800] = "";
+            if (chat_dpapi_val[0]) {
+                snprintf(chat_dpapi_field, sizeof(chat_dpapi_field),
+                         ",\"chat_dpapi\":\"%s\"", chat_dpapi_val);
+            }
             if (dpapi_ok && dpapi_ct) {
                 size_t b64_need = ((size_t)dpapi_len + 2) / 3 * 4 + 1;  // +1 for '\0'
                 char *dpapi_b64 = (char *)malloc(b64_need);
                 if (dpapi_b64) {
                     b64enc(dpapi_ct, dpapi_len, dpapi_b64);
-                    fprintf(f, "{\"version\":2,\"dpapi\":\"%s\"}", dpapi_b64);
+                    fprintf(f, "{\"version\":2,\"dpapi\":\"%s\"%s}", dpapi_b64, chat_dpapi_field);
                     free(dpapi_b64);
                     log_line("配置已保存(v2.0 DPAPI加密)");
                 } else {
-                    fprintf(f, "{\"salt\":\"%s\",\"accounts\":[{\"user_account\":\"%s\",\"password\":\"%s\",\"device_code\":\"%s\"}]}",
-                            salt, enc_user, enc_pass, enc_dc);
+                    fprintf(f, "{\"salt\":\"%s\",\"accounts\":[{\"user_account\":\"%s\",\"password\":\"%s\",\"device_code\":\"%s\"}]%s}",
+                            salt, enc_user, enc_pass, enc_dc, chat_dpapi_field);
                     log_line("内存不足，已保存(v1.x ChaCha20加密)");
                     dpapi_ok = 0;
                 }
                 LocalFree(dpapi_ct);
             } else {
-                fprintf(f, "{\"salt\":\"%s\",\"accounts\":[{\"user_account\":\"%s\",\"password\":\"%s\",\"device_code\":\"%s\"}]}",
-                        salt, enc_user, enc_pass, enc_dc);
+                fprintf(f, "{\"salt\":\"%s\",\"accounts\":[{\"user_account\":\"%s\",\"password\":\"%s\",\"device_code\":\"%s\"}]%s}",
+                        salt, enc_user, enc_pass, enc_dc, chat_dpapi_field);
                 log_line("DPAPI不可用，已保存(v1.x ChaCha20加密)");
             }
             fclose(f);
@@ -5940,6 +5982,225 @@ typedef struct {
 } ChatParam;
 
 /**
+ * save_chat_state - 持久化 chat 会话状态到 config.json 的 chat_dpapi 字段
+ *
+ * config.json 格式:
+ *   {"version":2,"dpapi":"<凭据>","chat_dpapi":"<base64(DPAPI(chat_json))>"}
+ * chat_dpapi 与 dpapi 独立加密，互不影响。
+ *
+ * 隐私模式 /p 下不保存。
+ */
+static void save_chat_state(void) {
+    if (g_privacy) return;
+    if (!g_chat.client_key[0]) return;  /* 无 client_key 说明从未登录过，不保存 */
+
+    char exe_path[MAX_PATH];
+    GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+    char *slash = strrchr(exe_path, '\\');
+    if (slash) *slash = 0;
+    char config_path[MAX_PATH];
+    snprintf(config_path, sizeof(config_path), "%s\\config.json", exe_path);
+
+    char fp[65];
+    get_fingerprint(fp);
+
+    /* 构造 chat 内部 JSON */
+    size_t need = 256 + strlen(g_chat.cookies) + strlen(g_chat.session_key) +
+                  strlen(g_chat.client_key) + strlen(g_chat.xuid);
+    char *inner = (char *)malloc(need);
+    if (!inner) return;
+    int ilen = snprintf(inner, need,
+        "{\"client_key\":\"%s\",\"cookies\":\"%s\",\"sk\":\"%s\","
+        "\"session_key\":\"%s\",\"xuid\":\"%s\",\"tenant_id\":%d,"
+        "\"last_sent_date\":\"%s\"}",
+        g_chat.client_key, g_chat.cookies, g_chat.sk,
+        g_chat.session_key, g_chat.xuid, g_chat.tenant_id,
+        g_chat.last_sent_date);
+
+    /* DPAPI 加密 */
+    uint8_t *ct = NULL; DWORD ct_len = 0;
+    if (!protect_data_dpapi((const uint8_t *)inner, (DWORD)ilen, fp, &ct, &ct_len)) {
+        SecureZeroMemory(inner, ilen);
+        free(inner);
+        return;
+    }
+    SecureZeroMemory(inner, ilen);
+    free(inner);
+
+    size_t b64_need = ((size_t)ct_len + 2) / 3 * 4 + 1;
+    char *b64 = (char *)malloc(b64_need);
+    if (!b64) { LocalFree(ct); return; }
+    b64enc(ct, ct_len, b64);
+    LocalFree(ct);
+
+    /* 读取现有 config.json，合并 chat_dpapi 字段后写回 */
+    FILE *f = fopen(config_path, "rb");
+    char *old = NULL;
+    size_t old_len = 0;
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        old_len = (size_t)ftell(f);
+        if (old_len > 0 && old_len < 1024 * 1024) {
+            fseek(f, 0, SEEK_SET);
+            old = (char *)malloc(old_len + 1);
+            if (old) {
+                size_t rd = fread(old, 1, old_len, f);
+                old[rd] = 0;
+            }
+        }
+        fclose(f);
+    }
+
+    /* 构造新的 config.json */
+    char *new_cfg = NULL;
+    if (old && old[0]) {
+        /* 查找已有的 "chat_dpapi" 字段 */
+        const char *cdp = strstr(old, "\"chat_dpapi\"");
+        if (cdp) {
+            /* 替换现有值: 找到值的起止引号 */
+            const char *vp = cdp + strlen("\"chat_dpapi\"");
+            while (*vp == ' ' || *vp == ':') vp++;
+            if (*vp == '"') {
+                vp++;
+                const char *ve = strchr(vp, '"');
+                if (ve) {
+                    size_t prefix_len = (size_t)(vp - old);
+                    size_t suffix_start = (size_t)(ve - old);
+                    size_t new_len = prefix_len + strlen(b64) + (old_len - suffix_start) + 1;
+                    new_cfg = (char *)malloc(new_len);
+                    if (new_cfg) {
+                        memcpy(new_cfg, old, prefix_len);
+                        strcpy(new_cfg + prefix_len, b64);
+                        strcat(new_cfg, old + suffix_start);
+                    }
+                }
+            }
+        } else {
+            /* 追加到 JSON 末尾(在最后一个 } 前插入) */
+            char *last_brace = strrchr(old, '}');
+            if (last_brace) {
+                size_t pos = (size_t)(last_brace - old);
+                /* 检查 } 前是否需要逗号 */
+                size_t i = pos;
+                int need_comma = 0;
+                while (i > 0 && (old[i-1] == ' ' || old[i-1] == '\t' ||
+                                 old[i-1] == '\r' || old[i-1] == '\n')) i--;
+                if (i > 0 && old[i-1] != '{') need_comma = 1;
+
+                size_t new_len = pos + (need_comma ? 1 : 0) +
+                                 strlen(",\"chat_dpapi\":\"") + strlen(b64) +
+                                 strlen("\"}") + 1;
+                new_cfg = (char *)malloc(new_len);
+                if (new_cfg) {
+                    memcpy(new_cfg, old, pos);
+                    new_cfg[pos] = 0;
+                    if (need_comma) strcat(new_cfg, ",");
+                    strcat(new_cfg, "\"chat_dpapi\":\"");
+                    strcat(new_cfg, b64);
+                    strcat(new_cfg, "\"}");
+                }
+            }
+        }
+    } else {
+        /* 无现有 config.json，创建新的 */
+        size_t new_len = strlen("{\"chat_dpapi\":\"") + strlen(b64) + strlen("\"}") + 1;
+        new_cfg = (char *)malloc(new_len);
+        if (new_cfg) {
+            strcpy(new_cfg, "{\"chat_dpapi\":\"");
+            strcat(new_cfg, b64);
+            strcat(new_cfg, "\"}");
+        }
+    }
+    if (old) { SecureZeroMemory(old, old_len); free(old); }
+
+    if (new_cfg) {
+        f = fopen(config_path, "w");
+        if (f) {
+            fputs(new_cfg, f);
+            fclose(f);
+        }
+        free(new_cfg);
+    }
+    free(b64);
+}
+
+/**
+ * load_chat_state - 从 config.json 的 chat_dpapi 字段恢复 chat 会话状态
+ *
+ * @return 1=成功恢复, 0=无 chat_dpapi 或解密失败
+ */
+static int load_chat_state(void) {
+    char exe_path[MAX_PATH];
+    GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+    char *slash = strrchr(exe_path, '\\');
+    if (slash) *slash = 0;
+    char config_path[MAX_PATH];
+    snprintf(config_path, sizeof(config_path), "%s\\config.json", exe_path);
+
+    FILE *f = fopen(config_path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    if (fsize <= 0 || fsize > 65536) { fclose(f); return 0; }
+    fseek(f, 0, SEEK_SET);
+    char *content = (char *)malloc(fsize + 1);
+    if (!content) { fclose(f); return 0; }
+    size_t clen = fread(content, 1, fsize, f);
+    content[clen] = 0;
+    fclose(f);
+
+    char fp[65];
+    get_fingerprint(fp);
+
+    int got = 0;
+    /* 查找 "chat_dpapi" 字段(而非 "dpapi") */
+    const char *dp = strstr(content, "\"chat_dpapi\"");
+    if (dp) {
+        dp += strlen("\"chat_dpapi\"");
+        while (*dp == ' ' || *dp == ':') dp++;
+        if (*dp == '"') {
+            dp++;
+            const char *dpe = strchr(dp, '"');
+            if (dpe) {
+                size_t dp_len = (size_t)(dpe - dp);
+                uint8_t *ct = (uint8_t *)malloc(dp_len);
+                if (ct) {
+                    size_t ct_len = b64dec(dp, dp_len, ct);
+                    if (ct_len > 0) {
+                        uint8_t *inner = NULL; DWORD inner_len = 0;
+                        if (unprotect_data_dpapi(ct, (DWORD)ct_len, fp, &inner, &inner_len)) {
+                            char *json = (char *)malloc(inner_len + 1);
+                            if (json) {
+                                memcpy(json, inner, inner_len);
+                                json[inner_len] = 0;
+                                /* 解析各字段 */
+                                jstr(json, "client_key", g_chat.client_key, sizeof(g_chat.client_key));
+                                jstr(json, "cookies", g_chat.cookies, sizeof(g_chat.cookies));
+                                jstr(json, "sk", g_chat.sk, sizeof(g_chat.sk));
+                                jstr(json, "session_key", g_chat.session_key, sizeof(g_chat.session_key));
+                                jstr(json, "xuid", g_chat.xuid, sizeof(g_chat.xuid));
+                                jstr(json, "last_sent_date", g_chat.last_sent_date, sizeof(g_chat.last_sent_date));
+                                char tid[16]; jstr(json, "tenant_id", tid, sizeof(tid));
+                                if (tid[0]) g_chat.tenant_id = atoi(tid);
+                                else g_chat.tenant_id = 15;
+                                if (g_chat.sk[0]) g_chat.logged_in = 1;
+                                SecureZeroMemory(json, inner_len);
+                                free(json);
+                                got = 1;
+                            }
+                            LocalFree(inner);
+                        }
+                    }
+                    free(ct);
+                }
+            }
+        }
+    }
+    free(content);
+    return got;
+}
+
+/**
  * chat_do_daily_task - 执行一次对话任务(登录+发消息)
  *
  * @return 1=成功, 0=失败
@@ -5950,6 +6211,7 @@ static int chat_do_daily_task(ChatParam *cp) {
             log_line("[eaichat] 登录失败，跳过本次对话");
             return 0;
         }
+        save_chat_state();  /* 登录成功后持久化会话 */
     }
 
     /* 随机选预设消息 */
@@ -5964,6 +6226,7 @@ static int chat_do_daily_task(ChatParam *cp) {
         log_line("[eaichat] 发送失败，尝试重新登录");
         g_chat.logged_in = 0;
         if (chat_login(&g_chat, cp->user, cp->password_sha)) {
+            save_chat_state();  /* 重登后也持久化 */
             if (chat_send_message(&g_chat, msg, reply, sizeof(reply), "")) {
                 log_line("[eaichat] 重登后对话成功");
                 return 1;
@@ -5978,10 +6241,16 @@ static int chat_do_daily_task(ChatParam *cp) {
  * chat_thread - 对话线程主循环
  *
  * 首次启动后立即发一条(可选)，之后每天检查日期变化时发一条。
- * 通过 g_chat_last_sent_date 避免重启后当天重复发送。
+ * 通过 last_sent_date(持久化到 chat_state.json) 避免重启后当天重复发送。
  */
 static DWORD WINAPI chat_thread(LPVOID param) {
     ChatParam *cp = (ChatParam *)param;
+
+    /* 启动时尝试恢复上次会话状态(client_key/cookies/sk/last_sent_date) */
+    if (load_chat_state()) {
+        log_line("[eaichat] 已从 config.json 恢复会话(sk=%s, last_sent=%s)",
+                 g_chat.sk[0] ? "有" : "无", g_chat.last_sent_date);
+    }
 
     /* /chatnow: 立即发一条 */
     if (g_chat_now) {
@@ -5992,6 +6261,7 @@ static DWORD WINAPI chat_thread(LPVOID param) {
         GetLocalTime(&st);
         snprintf(g_chat.last_sent_date, sizeof(g_chat.last_sent_date),
                  "%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
+        save_chat_state();  /* 持久化 last_sent_date */
     }
 
     while (g_running && !InterlockedCompareExchange(&g_auth_expired, 0, 0)) {
@@ -6026,6 +6296,7 @@ static DWORD WINAPI chat_thread(LPVOID param) {
         if (chat_do_daily_task(cp)) {
             strncpy(g_chat.last_sent_date, today, sizeof(g_chat.last_sent_date) - 1);
             g_chat.last_sent_date[sizeof(g_chat.last_sent_date) - 1] = 0;
+            save_chat_state();  /* 持久化 last_sent_date */
             log_line("[eaichat] 今日对话任务完成");
         }
     }

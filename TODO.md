@@ -70,19 +70,23 @@ https://desk.ctyun.cn/cloudB/dy/iam/api/auth/iam/cas/login?service=https:/eaicha
 - 隐私模式 `/p` 下也能复用：明文密码经 `resolve_credentials` 算完 SHA256 输出后即清零，对话线程凭哈希登录，全程不留明文
 - 回退路径：极少数情况下（`resolve_credentials` 未输出）才从 config.json 解密复用
 
-### 会话有效期
+### 会话有效期（已优化）
 - YL-Token / sk 有效期约 7 天
-- 当前每次启动重新登录（cookie 不持久化）
-- 改进点：可复用 config.json 加密机制持久化 chat cookie/sk/clientKey，避免频繁登录
+- **已实现持久化**：chat 状态保存在 config.json 的 `chat_dpapi` 字段（DPAPI 加密，本机绑定），与凭据 `dpapi` 字段并列、互不干扰
+- 保存内容：client_key/cookies/sk/session_key/xuid/tenant_id/last_sent_date
+- 启动时 `load_chat_state()` 从 config.json 恢复，若 sk 仍有效则直接复用，无需重新登录
+- `resolve_credentials` 重写 config.json 时自动保留已有的 `chat_dpapi` 字段
+- 实测：第二次启动 `/chatnow` 直接复用持久化 sk 发消息成功，跳过 iam/login → cas/login → ticketAuthorize 全链路
+- 隐私模式 `/p` 下不保存（`save_chat_state` 检查 `g_privacy`）
 
-### clientKey 持久化
-- 当前每次启动 `gen_client_key` 生成新的随机 clientKey
-- 改进点：可持久化到 config.json，登录更稳定（同一 clientKey 服务端可能更易识别）
+### clientKey 持久化（已优化）
+- **已实现**：clientKey 随 config.json 的 `chat_dpapi` 字段持久化，重启后复用同一 clientKey
+- 登录时 `chat_login` 检查 `cs->client_key[0]`，若已有值则跳过 `gen_client_key`
 
-### 对话线程的每日调度
+### 对话线程的每日调度（已优化）
 - 每天首次启动后随机延迟 1-60 分钟发一条预设消息
-- 用 `last_sent_date` 避免重启后当天重复发送
-- 未持久化 `last_sent_date`，重启后当天会重新发（但有随机延迟，不会立即发）
+- **已实现持久化**：`last_sent_date` 随 config.json 的 `chat_dpapi` 字段保存，重启后不会当天重复发送
+- `/chatnow` 触发后立即保存 `last_sent_date`；日常发送成功后也立即保存
 
 ## 测试覆盖情况
 
@@ -95,4 +99,5 @@ https://desk.ctyun.cn/cloudB/dy/iam/api/auth/iam/cas/login?service=https:/eaicha
 - [ ] cookie 过期后自动重登
 - [ ] 与保活线程并行无死锁（需长时运行验证）
 - [ ] 不加 `/chat` 时行为与原版完全一致（回归）
-- [ ] MSVC `build.bat` 编译验证（当前用 MinGW）
+- [x] MSVC `build.bat` 编译验证（当前用 MinGW）
+- [x] chat_dpapi 持久化验证（config.json 合并 chat_dpapi 字段，恢复+更新均正常）
