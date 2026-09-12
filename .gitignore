@@ -10,11 +10,21 @@ bin/
 
 # Runtime files
 run.log
+points.log
+points_*.log
+points_auto.log
 config.json
 questions.txt
 chat_state.json
+dump.txt
 
-# IDE files
+# Reverse-engineering / local-only assets
+main.*.js
+assets/
+.uploads/
+
+# AI / IDE files
+.trae/
 .vs/
 *.user
 *.suo
