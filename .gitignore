@@ -16,6 +16,7 @@ points_auto.log
 config.json
 questions.txt
 chat_state.json
+points_launch.dat
 dump.txt
 
 # Reverse-engineering / local-only assets

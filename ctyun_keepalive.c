@@ -1,7 +1,10 @@
 /*
- * ctyun_keepalive.c - 天翼云电脑保活客户端 (C语言版) v1.4.0
+ * ctyun_keepalive.c - 天翼云电脑保活客户端 (C语言版) v1.5.0
  *
  * 公共逻辑(HTTP/加密/登录/WebSocket/桌面解析等)见 ctyun_common.c / ctyun_common.h。
+ * v1.5.0 起常驻守护内置"积分调度线程"：每日05:00以无窗口子进程方式拉起
+ * ctyun_points.exe(登录1002 + eaichat 1004 + 挂机1003)，守护晚启动时当天自动补跑；
+ * 不再依赖 Windows 计划任务，直接运行本程序即完成全部部署。
  *
  * 编译 (MSVC x64):
  *   cl /O2 /MD /GS- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8 /GL ^
@@ -21,7 +24,7 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "psapi.lib")
 
-#define APP_VERSION   "1.4.0"
+#define APP_VERSION   "1.5.0"
 
 #define MAX_DESKTOPS  10
 #define MAX_THREADS   (MAX_DESKTOPS + 3)
@@ -64,6 +67,9 @@ static volatile LONG g_bg_switch = 0;
 static int g_privacy = 0;
 
 static int g_random = 0;
+
+/* /testsched 自测钩子: 只跑积分调度线程一轮(不登录/不保活)，验证完即退出 */
+static int g_test_sched = 0;
 
 
 
@@ -1668,6 +1674,238 @@ void ct_log(const char *fmt, ...) {
     log_line("%s", b);
 }
 
+/* ======================== 积分程序每日调度 (v1.5.0) ========================
+ *
+ * 取代 v1.4.0 的计划任务方案：常驻守护自身负责每日 05:00 拉起 ctyun_points.exe。
+ *
+ * 行为:
+ *  - 每天 05:00(本地时间)以 CREATE_NO_WINDOW 子进程启动一次 points，工作目录=
+ *    本 exe 所在目录(points 依赖 cwd 读取 config.json)；
+ *  - 守护在 05:00 之后才启动(开机晚/重启)且今天没拉起过 → 立即补跑(StartWhenAvailable)；
+ *  - points_launch.dat 记录最后拉起日期；points 另带单实例命名互斥，双重防同账号顶号；
+ *  - 调度线程同步等待 points 结束(拿满即止/6h硬上限)，期间不再发起第二次；
+ *  - 首次运行幂等删除 v1.4.0 时代的旧计划任务 ctyun_points(退出码非0即"本不存在"，忽略)。
+ *
+ * 调试/排障钩子(环境变量):
+ *  CTYUN_POINTS_EXE       覆盖被拉起的 exe 全路径(默认 <本目录>\ctyun_points.exe)
+ *  CTYUN_POINTS_ARGS      覆盖命令行参数(默认无参)
+ *  CTYUN_POINTS_KEEP_TASK 非空则不清理旧计划任务
+ *  CLI: /testsched        只跑一轮调度逻辑(不登录/不保活)，用于验证
+ */
+#define POINTS_SCHED_HOUR     5
+#define POINTS_LEGACY_TASK    "ctyun_points"
+#define POINTS_MARK_FILE      "points_launch.dat"
+#define POINTS_DEFAULT_EXE    "ctyun_points.exe"
+
+/* 本 exe 所在目录(以反斜杠结尾) */
+static void points_module_dir(char *dir, size_t n) {
+    char exe[MAX_PATH];
+    DWORD got = GetModuleFileNameA(NULL, exe, MAX_PATH);
+    dir[0] = 0;
+    if (got > 0 && got < MAX_PATH) {
+        strncpy(dir, exe, n - 1);
+        dir[n - 1] = 0;
+        char *sl = strrchr(dir, '\\');
+        if (sl) sl[1] = 0;
+    }
+    if (!dir[0]) { strcpy(dir, ".\\"); }
+}
+
+static void points_today_str(char *buf, size_t n) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    snprintf(buf, n, "%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
+}
+
+/* 决定被拉起的 exe 路径与参数(支持环境变量覆盖) */
+static void points_resolve_target(char *exe, size_t exe_n,
+                                  char *args, size_t args_n,
+                                  const char *dir) {
+    const char *env_exe = getenv("CTYUN_POINTS_EXE");
+    if (env_exe && env_exe[0]) {
+        strncpy(exe, env_exe, exe_n - 1);
+        exe[exe_n - 1] = 0;
+    } else {
+        snprintf(exe, exe_n, "%s%s", dir, POINTS_DEFAULT_EXE);
+    }
+    const char *env_args = getenv("CTYUN_POINTS_ARGS");
+    if (env_args) {
+        strncpy(args, env_args, args_n - 1);
+        args[args_n - 1] = 0;
+    } else {
+        args[0] = 0;
+    }
+}
+
+static int points_was_launched(const char *mark_path, const char *today) {
+    FILE *f = fopen(mark_path, "r");
+    if (!f) return 0;
+    char buf[32];
+    int hit = 0;
+    if (fgets(buf, sizeof(buf), f)) {
+        buf[strcspn(buf, "\r\n")] = 0;
+        hit = (strcmp(buf, today) == 0);
+    }
+    fclose(f);
+    return hit;
+}
+
+static void points_record_launched(const char *mark_path, const char *today) {
+    FILE *f = fopen(mark_path, "w");
+    if (!f) { log_line("积分调度: 警告，无法写启动标记 %s", mark_path); return; }
+    fprintf(f, "%s\n", today);
+    fclose(f);
+}
+
+/* 幂等清理 v1.4.0 时代的旧计划任务；任何失败均不影响守护 */
+static void points_cleanup_legacy_task(void) {
+    const char *keep = getenv("CTYUN_POINTS_KEEP_TASK");
+    if (keep && keep[0]) {
+        log_line("积分调度: CTYUN_POINTS_KEEP_TASK 已设置，保留旧计划任务");
+        return;
+    }
+    wchar_t cmdline[160];
+    _snwprintf(cmdline, 159, L"schtasks.exe /Delete /TN %hs /F", POINTS_LEGACY_TASK);
+    cmdline[159] = 0;
+    STARTUPINFOW si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&pi, sizeof(pi));
+    if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi)) {
+        log_line("积分调度: schtasks 调用失败(%lu，忽略)", (unsigned long)GetLastError());
+        return;
+    }
+    WaitForSingleObject(pi.hProcess, 15000);
+    DWORD rc = 1;
+    GetExitCodeProcess(pi.hProcess, &rc);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    if (rc == 0)
+        log_line("积分调度: 已清理旧计划任务 \"%s\"(此后由本守护直接拉起积分程序)",
+                 POINTS_LEGACY_TASK);
+    /* rc!=0: 任务本就不存在(0x80070002 等)，属于常态，不刷日志 */
+}
+
+/* 无窗口拉起积分程序并等待其结束；成功返回1，exit_code 输出子进程退出码 */
+static int points_launch_and_wait(const char *dir, const char *exe,
+                                  const char *args, DWORD *exit_code) {
+    char cmdline[2100];
+    snprintf(cmdline, sizeof(cmdline), "\"%s\"%s%s",
+             exe, (args[0] ? " " : ""), args);
+    STARTUPINFOA si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&pi, sizeof(pi));
+    /* NEW_PROCESS_GROUP: 守护 Ctrl+C 时不把子进程一起带走(points 自行拿满/6h退出) */
+    log_line("积分调度: 拉起 %s%s%s (工作目录 %s)",
+             exe, args[0] ? " " : "", args, dir);
+    if (!CreateProcessA(NULL, cmdline, NULL, NULL, FALSE,
+                        CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+                        NULL, dir, &si, &pi)) {
+        log_line("积分调度: 启动失败(%lu)", (unsigned long)GetLastError());
+        return 0;
+    }
+    CloseHandle(pi.hThread);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD rc = 1;
+    GetExitCodeProcess(pi.hProcess, &rc);
+    CloseHandle(pi.hProcess);
+    if (exit_code) *exit_code = rc;
+    return 1;
+}
+
+static DWORD WINAPI points_scheduler_thread(LPVOID param) {
+    HANDLE h_first_round = (HANDLE)param;  /* 仅 /testsched 时非空 */
+
+    char dir[MAX_PATH];
+    points_module_dir(dir, sizeof(dir));
+    char exe[MAX_PATH], args[1024];
+    points_resolve_target(exe, sizeof(exe), args, sizeof(args), dir);
+    char mark_path[MAX_PATH];
+    snprintf(mark_path, sizeof(mark_path), "%s%s", dir, POINTS_MARK_FILE);
+
+    log_line("积分调度: 线程已启动，每日%02d:00拉起积分程序(目标: %s)",
+             POINTS_SCHED_HOUR, exe);
+
+    if (!g_test_sched)
+        points_cleanup_legacy_task();
+
+    for (;;) {
+        char today[16];
+        points_today_str(today, sizeof(today));
+        int launched = points_was_launched(mark_path, today);
+
+        time_t now_t = time(NULL);
+        struct tm lt;
+        localtime_s(&lt, &now_t);
+        struct tm fire = lt;
+        fire.tm_hour = POINTS_SCHED_HOUR;
+        fire.tm_min = 0;
+        fire.tm_sec = 0;
+        time_t fire_t = mktime(&fire);
+
+        long wait_sec;
+        const char *decision;
+        if (launched) {
+            wait_sec = (long)(fire_t + 86400 - now_t);   /* 今天已跑: 明天05:00 */
+            decision = "今日已拉起过，等待次日";
+        } else if (fire_t > now_t) {
+            wait_sec = (long)(fire_t - now_t);           /* 今天05:00还没到 */
+            decision = "等待今日定点";
+        } else {
+            wait_sec = 0;                                /* 05:00已过且未跑: 立即补跑 */
+            decision = "定点已过且今日未拉起，立即补跑";
+        }
+        if (wait_sec < 0) wait_sec = 0;
+        log_line("积分调度: %s (今天=%s, 标记文件=%s, 距下次%ld秒)",
+                 decision, today, POINTS_MARK_FILE, wait_sec);
+
+        if (h_first_round) SetEvent(h_first_round);
+
+        if (g_test_sched) {
+            /* 自测: 等待分支到点即结束；补跑分支等子进程跑完后结束 */
+            if (wait_sec > 0) { log_line("积分调度[/testsched]: 首轮判定为等待，验证完成"); return 0; }
+        } else {
+            /* 分段睡眠，60秒一醒以响应 g_running 退出 */
+            while (wait_sec > 0 && g_running) {
+                DWORD chunk = (wait_sec > 60) ? 60 : (DWORD)wait_sec;
+                Sleep(chunk * 1000);
+                wait_sec -= (long)chunk;
+            }
+            if (!g_running) { log_line("积分调度: 收到停止信号，线程退出"); return 0; }
+            /* 触发前复核: 睡眠跨午夜后 today 已变化，旧标记比较无意义但补跑判据仍成立；
+             * 若等待期间已有其它实例(如前台过渡实例)完成拉起，则跳过本轮 */
+            char now_today[16];
+            points_today_str(now_today, sizeof(now_today));
+            if (points_was_launched(mark_path, now_today)) {
+                log_line("积分调度: 复核发现今日已被其它实例拉起，跳过本轮");
+                continue;
+            }
+        }
+
+        /* wait_sec == 0: 拉起积分程序 */
+        char fire_today[16];
+        points_today_str(fire_today, sizeof(fire_today));
+        DWORD rc = 0;
+        if (points_launch_and_wait(dir, exe, args, &rc)) {
+            points_record_launched(mark_path, fire_today);
+            log_line("积分调度: 积分程序已退出(退出码=%lu)，今日标记已写入", rc);
+        } else if (!g_test_sched) {
+            log_line("积分调度: 60秒后重试拉起");
+            Sleep(60000);
+        }
+
+        if (g_test_sched) { log_line("积分调度[/testsched]: 拉起-等待-标记流程验证完成"); return 0; }
+    }
+}
+
 /**
  * usage - 显示用法帮助
  */
@@ -1680,7 +1918,9 @@ static void usage(const char *exe) {
     printf("  /privacy,    /p  隐私模式，不保存用户名/密码到config.json\n");
     printf("  /random,     /r  随机生成设备码(默认基于机器指纹确定性生成)\n");
     printf("  /version,    /v  显示版本号\n");
-    printf("  /help,       /h  显示此帮助信息\n");
+    printf("  /help,       /h  显示此帮助信息\n\n");
+    printf("常驻运行期间每日05:00自动无窗口调用 ctyun_points.exe 完成积分任务\n");
+    printf("(登录1002 + AI对话1004 + 挂机1003)，无需安装计划任务。\n");
 }
 
 /**
@@ -1715,10 +1955,32 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "/version") == 0 || strcmp(argv[i], "/v") == 0) {
             printf("版本 " APP_VERSION "\n");
             return 0;
+        } else if (strcmp(argv[i], "/testsched") == 0) {
+            g_test_sched = 1;
         } else if (strcmp(argv[i], "/help") == 0 || strcmp(argv[i], "/h") == 0 || strcmp(argv[i], "/?") == 0) {
             usage(argv[0]);
             return 0;
         }
+    }
+
+    /* /testsched: 积分调度自测——只跑调度线程一轮，不登录/不连接桌面/不清理计划任务。
+     * 配合 CTYUN_POINTS_EXE / CTYUN_POINTS_ARGS 可用替身程序验证拉起与标记文件行为。 */
+    if (g_test_sched) {
+        log_line("=== /testsched 积分调度自测开始(不登录/不保活) ===");
+        HANDLE h_evt = CreateEvent(NULL, TRUE, FALSE, NULL);
+        HANDLE h_thr = CreateThread(NULL, THREAD_STACK, points_scheduler_thread, h_evt, 0, NULL);
+        if (h_thr) {
+            WaitForSingleObject(h_evt, 10000);
+            /* 补跑分支会等待子进程结束(替身程序通常几秒)，最多等90秒 */
+            WaitForSingleObject(h_thr, 90000);
+            CloseHandle(h_thr);
+        } else {
+            log_line("调度线程创建失败: %lu", (unsigned long)GetLastError());
+        }
+        if (h_evt) CloseHandle(h_evt);
+        log_line("=== /testsched 结束 ===");
+        if (g_log_file) fclose(g_log_file);
+        return 0;
     }
 
     /* 设置控制台字体为Consolas，确保中文正常显示 */
@@ -1854,6 +2116,16 @@ int main(int argc, char *argv[]) {
         }
 
         trim_working_set(1);
+
+        /* v1.5.0: 启动积分每日调度线程(取代计划任务)。必须在 run.log 打开之后启动，
+         * 否则 /__bg 模式下线程首条日志在 g_log_file 就绪前发出而丢失。前台过渡实例与
+         * /__bg 常驻实例都会启动它，靠 points_launch.dat 标记 + points 单实例互斥去重。 */
+        {
+            HANDLE h_sched = CreateThread(NULL, THREAD_STACK, points_scheduler_thread, NULL, 0, NULL);
+            if (h_sched) CloseHandle(h_sched);
+            else log_line("积分调度线程创建失败: %lu", (unsigned long)GetLastError());
+        }
+
         log_line("保活已启动, Ctrl+C 停止");
 
         while (g_running) {

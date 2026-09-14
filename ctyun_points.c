@@ -1,8 +1,10 @@
 /*
- * ctyun_points.c - 天翼云电脑积分挂机程序 (C语言版) v1.4.0
+ * ctyun_points.c - 天翼云电脑积分挂机程序 (C语言版) v1.5.0
  *
  * 公共逻辑见 ctyun_common.c / ctyun_common.h；eaichat 每日对话段自
- * ctyun_keepalive 迁入；计划任务支持纯C自注册(/install /uninstall)。
+ * ctyun_keepalive 迁入。v1.5.0 起不再自注册计划任务：由常驻的
+ * ctyun_keepalive 每日05:00以子进程方式调用本程序(直接运行keepalive即部署)。
+ * 本程序带单实例互斥量，重复启动会静默退出，避免同账号重复登录顶号。
  *
  * 编译 (MSVC x64):
  *   cl /O2 /MD /GS- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8 /GL ^
@@ -13,13 +15,13 @@
 
 #include "ctyun_common.h"
 
-#define APP_VERSION   "1.4.0"
+#define APP_VERSION   "1.5.0"
 
 #define KEEPALIVE_SECONDS  5400
 #define WS_POLL_TIMEOUT_MS  300    /* 单通道轮询接收超时(毫秒) */
 #define CLINK_HB_MAIN_MS    5000   /* MAIN通道应用层心跳间隔 */
 #define CLINK_HB_CHAN_MS    30000  /* DISPLAY/INPUTS通道应用层心跳间隔 */
-#define ADAPTIVE_MAX_SECONDS    21600  /* 硬上限6小时: 计划任务05:00 -> 11:00 */
+#define ADAPTIVE_MAX_SECONDS    21600  /* 硬上限6小时: keepalive 05:00拉起 -> 11:00 */
 #define TASK_CHECK_INTERVAL_SEC 270
 #define TASK_1003_TARGET        3600
 #define SESSION_ROTATE_SECONDS  300
@@ -34,7 +36,7 @@ static volatile LONG g_keep_seconds = KEEPALIVE_SECONDS;
  *   DISPLAY/INPUTS 子通道45秒被服务端踢除并重连无效，因桌面会话租约(connect token)未更新。
  * 对策: 每 g_session_rotate_secs(默认300秒) 主动整体重连(重新 connect，无需重新登录)，
  *   使每段都处于会计量的新鲜会话；同时每 g_task_check_secs 自查1003，拿满即止。 */
-#define ADAPTIVE_MAX_SECONDS    21600  /* 硬上限6小时: 计划任务05:00启动 -> 11:00 兜底 */
+#define ADAPTIVE_MAX_SECONDS    21600  /* 硬上限6小时: keepalive 05:00拉起 -> 11:00 兜底 */
 #define TASK_CHECK_INTERVAL_SEC 270    /* 约4.5分钟自查一次任务1003 */
 #define TASK_1003_TARGET        3600   /* 任务1003 "使用1小时" 目标秒数 */
 #define SESSION_ROTATE_SECONDS  300    /* 单条clink桌面会话最长连续秒数，到点主动整体重连 */
@@ -528,6 +530,9 @@ static int clink_open_channel(Session *s, Desktop *d, ClinkChan *ch,
     memset(ch, 0, sizeof(*ch));
     return 0;
 }
+
+/* 前向声明: ws_keepalive 周期自查任务1003，定义在后面(避免C4013隐式声明) */
+static int fetch_task_1003(const Session *s, long *progress, long *status);
 
 static int ws_keepalive(Session *s, Desktop *d, int session_seconds) {
     uint8_t *ws_buf = (uint8_t *)malloc(65536);
@@ -1370,7 +1375,7 @@ static size_t rsa_pkcs1_encrypt_hex(const uint8_t *pub_der, size_t der_len,
     CERT_PUBLIC_KEY_INFO *pki = NULL;
     DWORD pki_len = 0;
     if (!CryptDecodeObjectEx(X509_ASN_ENCODING, X509_PUBLIC_KEY_INFO,
-                             pub_der, der_len,
+                             pub_der, (DWORD)der_len,
                              CRYPT_DECODE_ALLOC_FLAG, NULL,
                              &pki, &pki_len)) {
         return 0;
@@ -2446,169 +2451,14 @@ static int chat_do_daily_task(ChatParam *cp) {
     return 1;
 }
 
-/* ======================== 计划任务纯C自注册 ======================== */
-
-#define POINTS_TASK_NAME        "ctyun_points"
-#define POINTS_TASK_XML_NAME    L"ctyun_points_task.xml"
-
-/* 隐藏窗口运行 schtasks.exe，返回其退出码；CreateProcess 失败返回 -1 */
-static int run_schtasks_hidden(const wchar_t *args) {
-    wchar_t cmdline[1024];
-    _snwprintf(cmdline, 1023, L"schtasks.exe %s", args);
-    cmdline[1023] = 0;
-    STARTUPINFOW si;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&pi, sizeof(pi));
-    if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE, CREATE_NO_WINDOW,
-                        NULL, NULL, &si, &pi)) {
-        log_line("schtasks 启动失败: %lu", (unsigned long)GetLastError());
-        return -1;
-    }
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD code = 1;
-    GetExitCodeProcess(pi.hProcess, &code);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    return (int)code;
-}
-
-/* 组装 Task Scheduler XML（UTF-8），返回堆字符串(调用者free) */
-static char *build_points_task_xml(const char *exe_path, const char *exe_dir,
-                                   const char *today) {
-    const char *fmt =
-"<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n"
-"<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n"
-"  <RegistrationInfo>\r\n"
-"    <Description>ctyun points daily keepalive (auto registered by ctyun_points.exe)</Description>\r\n"
-"  </RegistrationInfo>\r\n"
-"  <Triggers>\r\n"
-"    <CalendarTrigger>\r\n"
-"      <StartBoundary>%sT05:00:00</StartBoundary>\r\n"
-"      <Enabled>true</Enabled>\r\n"
-"      <ScheduleByDay>\r\n"
-"        <DaysInterval>1</DaysInterval>\r\n"
-"      </ScheduleByDay>\r\n"
-"    </CalendarTrigger>\r\n"
-"  </Triggers>\r\n"
-"  <Principals>\r\n"
-"    <Principal id=\"Author\">\r\n"
-"      <LogonType>InteractiveToken</LogonType>\r\n"
-"      <RunLevel>LeastPrivilege</RunLevel>\r\n"
-"    </Principal>\r\n"
-"  </Principals>\r\n"
-"  <Settings>\r\n"
-"    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n"
-"    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n"
-"    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n"
-"    <AllowHardTerminate>true</AllowHardTerminate>\r\n"
-"    <StartWhenAvailable>true</StartWhenAvailable>\r\n"
-"    <Enabled>true</Enabled>\r\n"
-"    <ExecutionTimeLimit>PT7H</ExecutionTimeLimit>\r\n"
-"  </Settings>\r\n"
-"  <Actions Context=\"Author\">\r\n"
-"    <Exec>\r\n"
-"      <Command>%s</Command>\r\n"
-"      <WorkingDirectory>%s</WorkingDirectory>\r\n"
-"    </Exec>\r\n"
-"  </Actions>\r\n"
-"</Task>\r\n";
-    size_t cap = strlen(fmt) + strlen(exe_path) + strlen(exe_dir) + 64;
-    char *xml = (char *)malloc(cap);
-    if (!xml) return NULL;
-    snprintf(xml, cap, fmt, today, exe_path, exe_dir);
-    return xml;
-}
-
-static int points_task_register(int verbose) {
-    char exe_path[MAX_PATH], exe_dir[MAX_PATH];
-    DWORD got = GetModuleFileNameA(NULL, exe_path, MAX_PATH);
-    if (got == 0 || got >= MAX_PATH) return 0;
-    strncpy(exe_dir, exe_path, sizeof(exe_dir) - 1);
-    exe_dir[sizeof(exe_dir) - 1] = 0;
-    char *slash = strrchr(exe_dir, '\\');
-    if (slash) *slash = 0; else return 0;
-
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    char today[16];
-    snprintf(today, sizeof(today), "%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
-
-    char *xml_utf8 = build_points_task_xml(exe_path, exe_dir, today);
-    if (!xml_utf8) return 0;
-
-    wchar_t tmp_dir[MAX_PATH], tmp_path[MAX_PATH];
-    DWORD tl = GetTempPathW(MAX_PATH, tmp_dir);
-    int ok = 0;
-    HANDLE hf = INVALID_HANDLE_VALUE;
-    if (tl > 0 && tl < MAX_PATH) {
-        _snwprintf(tmp_path, MAX_PATH, L"%s%s", tmp_dir, POINTS_TASK_XML_NAME);
-        tmp_path[MAX_PATH - 1] = 0;
-        int wlen = MultiByteToWideChar(CP_UTF8, 0, xml_utf8, -1, NULL, 0);
-        if (wlen > 0) {
-            wchar_t *xml_w = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
-            if (xml_w && MultiByteToWideChar(CP_UTF8, 0, xml_utf8, -1, xml_w, wlen) > 0) {
-                /* 写 UTF-16LE 文件(含 BOM)，与 encoding="UTF-16" 匹配 */
-                hf = CreateFileW(tmp_path, GENERIC_WRITE, 0, NULL,
-                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-                if (hf != INVALID_HANDLE_VALUE) {
-                    DWORD wr;
-                    unsigned char bom[2] = { 0xFF, 0xFE };
-                    if (WriteFile(hf, bom, 2, &wr, NULL) &&
-                        WriteFile(hf, xml_w, (DWORD)((wlen - 1) * sizeof(wchar_t)),
-                                  &wr, NULL)) {
-                        CloseHandle(hf);
-                        hf = INVALID_HANDLE_VALUE;
-                        wchar_t args[1200];
-                        _snwprintf(args, 1199,
-                                   L"/Create /TN %hs /XML \"%ls\" /F",
-                                   POINTS_TASK_NAME, tmp_path);
-                        args[1199] = 0;
-                        int rc = run_schtasks_hidden(args);
-                        ok = (rc == 0);
-                        if (!ok) log_line("schtasks /Create 失败, 退出码=%d", rc);
-                    }
-                }
-            }
-            free(xml_w);
-        }
-    }
-    if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
-    DeleteFileW(tmp_path);
-    free(xml_utf8);
-    if (verbose) {
-        if (ok) printf("计划任务 %s 安装成功：每日 05:00 交互登录时自动运行，时限 PT7H。\n",
-                       POINTS_TASK_NAME);
-        else printf("计划任务安装失败，请查看日志(points.log)。\n");
-    }
-    return ok;
-}
-
-static int points_task_unregister(int verbose) {
-    wchar_t args[128];
-    _snwprintf(args, 127, L"/Delete /TN %hs /F", POINTS_TASK_NAME);
-    args[127] = 0;
-    int rc = run_schtasks_hidden(args);
-    int ok = (rc == 0);
-    if (verbose) {
-        if (ok) printf("计划任务 %s 已卸载。\n", POINTS_TASK_NAME);
-        else printf("计划任务卸载失败(退出码=%d；任务可能本就不存在)。\n", rc);
-    }
-    return ok;
-}
-
-int install_points_task(void) {
-    log_open();
-    return points_task_register(1) ? 0 : 1;
-}
-
-int uninstall_points_task(void) {
-    log_open();
-    return points_task_unregister(1) ? 0 : 1;
-}
+/* ======================== 单实例保护 ======================== */
+/*
+ * v1.5.0: 积分流程改由常驻 ctyun_keepalive 每日05:00拉起，不再自注册计划任务。
+ * 同名互斥量保证全会话(同一登录桌面)只有一个 points 实例进入登录/挂机流程，
+ * 避免手动重复运行或 keepalive 重启补跑时同账号互顶(被顶会触发无谓的重登风暴)。
+ * /tasklist、/dump 等一次性查询不受互斥限制。
+ */
+#define POINTS_SINGLE_INSTANCE_MUTEX  "Local\\ctyun_points_single_v1"
 
 int main(int argc, char *argv[]) {
     SetConsoleOutputCP(CP_UTF8);
@@ -2636,11 +2486,10 @@ int main(int argc, char *argv[]) {
             printf("选项:\n");
             printf("  /user <账号>  /u <账号>    指定登录账号(手机号)\n");
             printf("  /pass <密码>  /p <密码>    指定登录密码\n");
-            printf("  (无参数)                   自适应挂机: 保活并周期自查1003，拿满即止，硬上限4小时\n");
+            printf("  (无参数)                   登录→每日AI对话(1004)→自适应挂机(1003)，拿满即止，硬上限6小时。\n"
+                   "                             通常由常驻的 ctyun_keepalive 每日05:00自动调用，也可手动运行\n");
             printf("  /seconds <秒> /s <秒>     指定固定挂机时长(显式指定后关闭自适应, <%d秒)\n", 7200);
             printf("  /tasklist     /t           仅登录并查询积分任务列表(测试验证，不兑换)后退出\n");
-            printf("  /install                    安装每日05:00积分挂机计划任务(自注册)\n");
-            printf("  /uninstall                  卸载积分挂机计划任务\n");
             printf("  /nochat                     本次运行不执行每日AI对话任务\n");
             printf("  /help         /h           显示帮助信息\n");
             printf("  /version      /v           显示版本号\n\n");
@@ -2667,10 +2516,6 @@ int main(int argc, char *argv[]) {
             tasklist_only = 1;
         } else if (_stricmp(argv[i], "/dump") == 0 || _stricmp(argv[i], "--dump") == 0) {
             dump_only = 1;
-        } else if (_stricmp(argv[i], "/install") == 0) {
-            return install_points_task();
-        } else if (_stricmp(argv[i], "/uninstall") == 0) {
-            return uninstall_points_task();
         } else if (_stricmp(argv[i], "/nochat") == 0) {
             nochat = 1;
         } else if ((_stricmp(argv[i], "/seconds") == 0 || _stricmp(argv[i], "/s") == 0 ||
@@ -2716,12 +2561,15 @@ int main(int argc, char *argv[]) {
     if (!tasklist_only && !dump_only)
         InterlockedExchange(&g_adaptive, fixed_secs ? 0 : 1);
 
-    /* 仅"无参进入当日挂机流程"时尽力幂等自注册；失败只警告，不影响本次运行 */
-    {
-        int normal_hang = (!tasklist_only && !dump_only && !fixed_secs);
-        if (normal_hang) {
-            if (points_task_register(0)) log_line("计划任务已就绪(每日05:00自启动)");
-            else log_line("计划任务自注册失败(不影响本次运行)，可稍后用 /install 手动安装");
+    /* 单实例保护: 仅挂机主流程受限(查询/诊断/帮助/版本不受影响)。
+     * 已有实例时静默成功退出，避免 keepalive 补跑或手动运行造成同账号顶号。 */
+    HANDLE h_single = NULL;
+    if (!tasklist_only && !dump_only) {
+        h_single = CreateMutexA(NULL, TRUE, POINTS_SINGLE_INSTANCE_MUTEX);
+        if (!h_single || GetLastError() == ERROR_ALREADY_EXISTS) {
+            log_line("已有一个积分挂机实例在运行，本次静默退出(避免重复登录顶号)");
+            if (g_logfp) fclose(g_logfp);
+            return 0;
         }
     }
 
