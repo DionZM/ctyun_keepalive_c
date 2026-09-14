@@ -1,77 +1,29 @@
 /*
- * ctyun_points.c - 天翼云电脑积分挂机程序 (C语言版)
+ * ctyun_points.c - 天翼云电脑积分挂机程序 (C语言版) v1.4.0
  *
- * 功能概述:
- *   自动登录天翼云电脑平台，获取桌面列表，连接一个桌面后WebSocket挂机1.5小时(5400秒)，
- *   挂机期间定时发送Ping和鼠标移动消息维持活跃，挂机结束后正常退出。
+ * 公共逻辑见 ctyun_common.c / ctyun_common.h；eaichat 每日对话段自
+ * ctyun_keepalive 迁入；计划任务支持纯C自注册(/install /uninstall)。
  *
  * 编译 (MSVC x64):
- *   cl /O2 /MD /GS- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8 /GL ctyun_points.c ^
+ *   cl /O2 /MD /GS- /DNDEBUG /D_CRT_SECURE_NO_WARNINGS /utf-8 /GL ^
+ *      /DWS_RECV_TIMEOUT_MS=60000 ctyun_common.c ctyun_points.c /Fe:ctyun_points.exe ^
  *      /link /SUBSYSTEM:CONSOLE /STACK:131072,131072 /OPT:REF /OPT:ICF /LTCG ^
- *      winhttp.lib ws2_32.lib crypt32.lib advapi32.lib iphlpapi.lib bcrypt.lib user32.lib
+ *      winhttp.lib ws2_32.lib crypt32.lib advapi32.lib iphlpapi.lib bcrypt.lib user32.lib shell32.lib
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-#include <stdint.h>
-#include <stdarg.h>
+#include "ctyun_common.h"
 
-#include <winsock2.h>
-#include <windows.h>
-#include <shellapi.h>
-#include <wincrypt.h>
-#include <winhttp.h>
-#include <bcrypt.h>
-#include <iphlpapi.h>
+#define APP_VERSION   "1.4.0"
 
-#ifndef CALG_SHA_256
-#define CALG_SHA_256 0x0000800c
-#endif
-
-#pragma comment(lib, "winhttp.lib")
-#pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "crypt32.lib")
-#pragma comment(lib, "advapi32.lib")
-#pragma comment(lib, "iphlpapi.lib")
-#pragma comment(lib, "bcrypt.lib")
-#pragma comment(lib, "user32.lib")
-#pragma comment(lib, "shell32.lib")
-
-#define APP_VERSION   "1.2.0-points"
-
-#define MAX_RESP      65536
-#define WS_RECV_BUF_SIZE   8192
-#define CAPTCHA_IMG_BUF    65536
-#define OCR_RESP_BUF       4096
-#define WS_PING_INTERVAL_MS 15000
-#define WS_MOUSE_INTERVAL_MS 30000
-#define WS_SEND_DELAY_MS   100
 #define KEEPALIVE_SECONDS  5400
-#define DNS_RESOLVE_TIMEOUT_MS 10000
-#define WINHTTP_CONNECT_TIMEOUT_MS  15000
-#define WINHTTP_SEND_TIMEOUT_MS     30000
-#define WINHTTP_RECEIVE_TIMEOUT_MS  30000
-#define WS_RECV_TIMEOUT_MS  60000
-#define WS_POLL_TIMEOUT_MS  300    /* 单通道轮询接收超时(毫秒)，保证多通道及时排空/响应 */
-#define CLINK_HB_MAIN_MS    5000   /* MAIN通道应用层心跳(CLINK_MSGC_HEARTBEAT)间隔 */
+#define WS_POLL_TIMEOUT_MS  300    /* 单通道轮询接收超时(毫秒) */
+#define CLINK_HB_MAIN_MS    5000   /* MAIN通道应用层心跳间隔 */
 #define CLINK_HB_CHAN_MS    30000  /* DISPLAY/INPUTS通道应用层心跳间隔 */
-#define OCR_SERVICE_URL    "https://orc.1999111.xyz/ocr"
-#define MAX_LOGIN_ATTEMPTS 3
-#define MAX_MANUAL_CAPTCHA_ATTEMPTS 3
+#define ADAPTIVE_MAX_SECONDS    21600  /* 硬上限6小时: 计划任务05:00 -> 11:00 */
+#define TASK_CHECK_INTERVAL_SEC 270
+#define TASK_1003_TARGET        3600
+#define SESSION_ROTATE_SECONDS  300
 
-#ifndef WINHTTP_WEB_SOCKET_PING_BUFFER_TYPE
-#define WINHTTP_WEB_SOCKET_PING_BUFFER_TYPE         3
-#endif
-#ifndef WINHTTP_WEB_SOCKET_PONG_BUFFER_TYPE
-#define WINHTTP_WEB_SOCKET_PONG_BUFFER_TYPE         4
-#endif
-
-static HCRYPTPROV g_crypt = 0;
-static HINTERNET g_inet = NULL;
-static BCRYPT_ALG_HANDLE g_rsa_alg = NULL;
-static volatile LONG g_running = 1;
 static FILE *g_logfp = NULL;
 static volatile LONG g_keep_seconds = KEEPALIVE_SECONDS;
 
@@ -148,577 +100,6 @@ static void log_line(const char *fmt, ...) {
         fflush(g_logfp);
     }
 }
-
-static int crypto_init(void) {
-    if (!CryptAcquireContext(&g_crypt, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
-        fprintf(stderr, "CryptoAPI初始化失败: %lu\n", GetLastError());
-        return 0;
-    }
-    NTSTATUS status = BCryptOpenAlgorithmProvider(&g_rsa_alg, BCRYPT_RSA_ALGORITHM, NULL, 0);
-    if (!BCRYPT_SUCCESS(status)) {
-        fprintf(stderr, "CNG RSA算法提供者初始化失败: 0x%08X\n", (unsigned)status);
-        CryptReleaseContext(g_crypt, 0);
-        g_crypt = 0;
-        return 0;
-    }
-    return 1;
-}
-
-static void sha256(const uint8_t *d, size_t n, uint8_t *out) {
-    HCRYPTHASH h = 0;
-    if (!CryptCreateHash(g_crypt, CALG_SHA_256, 0, 0, &h)) { memset(out, 0, 32); return; }
-    if (!CryptHashData(h, (BYTE *)d, (DWORD)n, 0)) { CryptDestroyHash(h); memset(out, 0, 32); return; }
-    DWORD dl = 32;
-    if (!CryptGetHashParam(h, HP_HASHVAL, out, &dl, 0)) { memset(out, 0, 32); }
-    CryptDestroyHash(h);
-}
-
-static const char HEX_LUT[] = "0123456789abcdef";
-
-static size_t url_encode(const char *in, char *out, size_t out_sz) {
-    static const uint8_t URL_SAFE[256] = {
-        ['A']=1,['B']=1,['C']=1,['D']=1,['E']=1,['F']=1,['G']=1,['H']=1,
-        ['I']=1,['J']=1,['K']=1,['L']=1,['M']=1,['N']=1,['O']=1,['P']=1,
-        ['Q']=1,['R']=1,['S']=1,['T']=1,['U']=1,['V']=1,['W']=1,['X']=1,
-        ['Y']=1,['Z']=1,
-        ['a']=1,['b']=1,['c']=1,['d']=1,['e']=1,['f']=1,['g']=1,['h']=1,
-        ['i']=1,['j']=1,['k']=1,['l']=1,['m']=1,['n']=1,['o']=1,['p']=1,
-        ['q']=1,['r']=1,['s']=1,['t']=1,['u']=1,['v']=1,['w']=1,['x']=1,
-        ['y']=1,['z']=1,
-        ['0']=1,['1']=1,['2']=1,['3']=1,['4']=1,['5']=1,['6']=1,['7']=1,
-        ['8']=1,['9']=1,
-        ['-']=1,['_']=1,['.']=1,['~']=1
-    };
-    size_t j = 0;
-    if (out_sz < 4) { if (out_sz > 0) out[0] = 0; return 0; }
-    for (size_t i = 0; in[i] && j < out_sz - 4; i++) {
-        unsigned char c = (unsigned char)in[i];
-        if (URL_SAFE[c]) {
-            out[j++] = in[i];
-        } else {
-            out[j++] = '%';
-            out[j++] = HEX_LUT[c >> 4];
-            out[j++] = HEX_LUT[c & 0x0F];
-        }
-    }
-    out[j] = 0;
-    return j;
-}
-
-static void sha256_hex(const char *s, char *out) {
-    uint8_t d[32];
-    sha256((const uint8_t *)s, strlen(s), d);
-    for (int i = 0; i < 32; i++) {
-        out[i * 2] = HEX_LUT[d[i] >> 4];
-        out[i * 2 + 1] = HEX_LUT[d[i] & 0x0F];
-    }
-    out[64] = 0;
-}
-
-static void md5_hex(const char *s, char *out) {
-    HCRYPTHASH h;
-    if (!CryptCreateHash(g_crypt, CALG_MD5, 0, 0, &h)) { out[0] = 0; return; }
-    if (!CryptHashData(h, (BYTE *)s, (DWORD)strlen(s), 0)) { CryptDestroyHash(h); out[0] = 0; return; }
-    uint8_t d[16];
-    DWORD dl = 16;
-    if (!CryptGetHashParam(h, HP_HASHVAL, d, &dl, 0)) { CryptDestroyHash(h); out[0] = 0; return; }
-    CryptDestroyHash(h);
-    for (int i = 0; i < 16; i++) {
-        out[i * 2] = HEX_LUT[d[i] >> 4];
-        out[i * 2 + 1] = HEX_LUT[d[i] & 0x0F];
-    }
-    out[32] = 0;
-}
-
-static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-static size_t b64enc(const uint8_t *in, size_t n, char *out) {
-    size_t o = 0;
-    for (size_t i = 0; i < n; i += 3) {
-        int r = n - i > 3 ? 3 : (int)(n - i);
-        unsigned v = in[i] << 16;
-        if (r > 1) v |= in[i + 1] << 8;
-        if (r > 2) v |= in[i + 2];
-        out[o++] = B64[(v >> 18) & 63];
-        out[o++] = B64[(v >> 12) & 63];
-        out[o++] = r > 1 ? B64[(v >> 6) & 63] : '=';
-        out[o++] = r > 2 ? B64[v & 63] : '=';
-    }
-    out[o] = 0;
-    return o;
-}
-
-static int b64val(char c) {
-    if (c >= 'A' && c <= 'Z') return c - 'A';
-    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-    if (c >= '0' && c <= '9') return c - '0' + 52;
-    if (c == '+') return 62;
-    if (c == '/') return 63;
-    return -1;
-}
-
-static size_t b64dec(const char *in, size_t n, uint8_t *out) {
-    size_t o = 0;
-    int buf = 0, bits = 0;
-    for (size_t i = 0; i < n; i++) {
-        if (in[i] == '=') break;
-        int v = b64val(in[i]);
-        if (v < 0) return 0;
-        buf = (buf << 6) | v;
-        bits += 6;
-        if (bits >= 8) { bits -= 8; out[o++] = (buf >> bits) & 0xFF; }
-    }
-    return o;
-}
-
-static char *jstr(const char *j, const char *k, char *buf, size_t bsz) {
-    if (strlen(k) > 120) { buf[0] = 0; return buf; }
-    char srch[128];
-    snprintf(srch, sizeof(srch), "\"%s\"", k);
-    const char *p = strstr(j, srch);
-    if (!p) { buf[0] = 0; return buf; }
-    p += strlen(srch);
-    while (*p == ' ' || *p == ':') p++;
-    if (*p != '"') { buf[0] = 0; return buf; }
-    p++;
-    size_t i = 0;
-    while (*p && *p != '"' && i < bsz - 1) {
-        if (*p == '\\' && *(p + 1)) {
-            p++;
-            switch (*p) {
-                case 'n': buf[i++] = '\n'; break;
-                case 't': buf[i++] = '\t'; break;
-                case 'r': buf[i++] = '\r'; break;
-                case '"': buf[i++] = '"';  break;
-                case '\\': buf[i++] = '\\'; break;
-                case '/': buf[i++] = '/';  break;
-                default:  buf[i++] = *p;   break;
-            }
-            p++;
-        } else {
-            buf[i++] = *p++;
-        }
-    }
-    buf[i] = 0;
-    return buf;
-}
-
-static int jint(const char *j, const char *k) {
-    if (strlen(k) > 120) return 0;
-    char srch[128];
-    snprintf(srch, sizeof(srch), "\"%s\"", k);
-    const char *p = strstr(j, srch);
-    if (!p) return 0;
-    p += strlen(srch);
-    while (*p == ' ' || *p == ':') p++;
-    return atoi(p);
-}
-
-static const char *find_matching_brace(const char *start) {
-    if (!start || *start != '{') return NULL;
-    int depth = 0;
-    const char *p = start;
-    while (*p) {
-        if (*p == '"') {
-            p++;
-            while (*p && *p != '"') {
-                if (*p == '\\') p++;
-                p++;
-            }
-            if (!*p) return NULL;
-        } else if (*p == '{') {
-            depth++;
-        } else if (*p == '}') {
-            depth--;
-            if (depth == 0) return p;
-        }
-        p++;
-    }
-    return NULL;
-}
-
-#define JSON_MAX_DEPTH 16
-#define JSON_MAX_STRING_LEN 8192
-#define JSON_MAX_KEY_LEN 128
-#define JSON_MAX_NUMBER_LEN 64
-
-static int json_find_key_impl(const char *json, const char *key, const char **vstart, int *vlen, char *vtype, int depth);
-static char *jstr_range_impl(const char *start, const char *end, const char *k, char *buf, size_t bsz);
-
-static int json_find_key(const char *json, const char *key, const char **vstart, int *vlen, char *vtype) {
-    return json_find_key_impl(json, key, vstart, vlen, vtype, 0);
-}
-
-static int json_find_key_impl(const char *json, const char *key, const char **vstart, int *vlen, char *vtype, int depth) {
-    if (!json || !key || !vstart || !vlen || !vtype || depth > JSON_MAX_DEPTH) return 0;
-    size_t key_len = strlen(key);
-    if (key_len == 0 || key_len >= JSON_MAX_KEY_LEN) return 0;
-    const char *p = json;
-    size_t chars_since_quote_check = 0;
-
-    while (*p) {
-        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-        if (*p == '"') {
-            p++;
-            size_t match = 0;
-            const char *key_start = p;
-            while (*p && *p != '"' && match < key_len && match < JSON_MAX_KEY_LEN) {
-                if (*p == '\\') { p++; if (!*p) break; }
-                if (*p == key[match]) match++;
-                else break;
-                p++;
-            }
-            if (match == key_len && *p == '"') {
-                p++;
-                while (*p && (*p == ':' || *p == ' ' || *p == '\t')) p++;
-                if (*p == '"') {
-                    *vtype = 's';
-                    *vstart = ++p;
-                    *vlen = 0;
-                    chars_since_quote_check = 0;
-                    while (*p && *p != '"' && *vlen < JSON_MAX_STRING_LEN) {
-                        if (*p == '\\') { p++; chars_since_quote_check++; }
-                        p++;
-                        (*vlen)++;
-                        chars_since_quote_check++;
-                        if (chars_since_quote_check > JSON_MAX_STRING_LEN * 2) break;
-                    }
-                    return 1;
-                } else if (*p == '-' || (*p >= '0' && *p <= '9')) {
-                    *vtype = 'n';
-                    *vstart = p;
-                    *vlen = 0;
-                    while ((*p == '-' || (*p >= '0' && *p <= '9')) && *vlen < JSON_MAX_NUMBER_LEN) {
-                        p++;
-                        (*vlen)++;
-                    }
-                    return 1;
-                } else if (p[0] == 't' && p[1] == 'r' && p[2] == 'u' && p[3] == 'e') {
-                    *vtype = 'b';
-                    *vstart = p;
-                    *vlen = 4;
-                    return 1;
-                } else if (p[0] == 'f' && p[1] == 'a' && p[2] == 'l' && p[3] == 's' && p[4] == 'e') {
-                    *vtype = 'b';
-                    *vstart = p;
-                    *vlen = 5;
-                    return 1;
-                }
-            } else {
-                while (*p && *p != '"') {
-                    if (*p == '\\') p++;
-                    p++;
-                }
-            }
-        } else if (*p == '{') {
-            const char *end = find_matching_brace(p);
-            if (end) {
-                if (json_find_key_impl(p + 1, key, vstart, vlen, vtype, depth + 1)) {
-                    return 1;
-                }
-                p = end + 1;
-            } else break;
-        } else if (*p == '[') {
-            p++;
-            int bracket_depth = 1;
-            while (*p && bracket_depth > 0) {
-                if (*p == '"') {
-                    p++;
-                    while (*p && *p != '"') { if (*p == '\\') p++; p++; }
-                } else if (*p == '[') bracket_depth++;
-                else if (*p == ']') bracket_depth--;
-                p++;
-            }
-        } else p++;
-    }
-    return 0;
-}
-
-typedef struct {
-    char device_code[128];
-    char secret_key[128];
-    char user_account[128];
-    int user_id;
-    int tenant_id;
-    int logged_in;
-} Session;
-
-typedef struct {
-    char desktop_id[64];
-    char desktop_code[64];
-    char *host;
-    char *port;
-    char *clink_host;
-    char *ca_cert;
-    char *client_cert;
-    char *client_key;
-    char *token;
-    char *tenant_account;
-    int is_active;
-    char *connect_msg;
-    char *ws_uri;
-} Desktop;
-
-static char *str_dup(const char *s) {
-    if (!s || !s[0]) return NULL;
-    size_t n = strlen(s) + 1;
-    char *r = (char *)malloc(n);
-    if (!r) return NULL;
-    memcpy(r, s, n);
-    return r;
-}
-
-static uint32_t rotl32(uint32_t v, int n) { return (v << n) | (v >> (32 - n)); }
-
-static void qr(uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d) {
-    *a += *b; *d ^= *a; *d = rotl32(*d, 16);
-    *c += *d; *b ^= *c; *b = rotl32(*b, 12);
-    *a += *b; *d ^= *a; *d = rotl32(*d, 8);
-    *c += *d; *b ^= *c; *b = rotl32(*b, 7);
-}
-
-static void chacha20_block(const uint8_t key[32], uint32_t counter, const uint8_t nonce[12], uint8_t out[64]) {
-    uint32_t s[16] = { 0x61707865, 0x3320646e, 0x79622d32, 0x6b206574 };
-    for (int i = 0; i < 8; i++)
-        s[4 + i] = key[i * 4] | (key[i * 4 + 1] << 8) | (key[i * 4 + 2] << 16) | (key[i * 4 + 3] << 24);
-    s[12] = counter;
-    for (int i = 0; i < 3; i++)
-        s[13 + i] = nonce[i * 4] | (nonce[i * 4 + 1] << 8) | (nonce[i * 4 + 2] << 16) | (nonce[i * 4 + 3] << 24);
-    uint32_t w[16];
-    memcpy(w, s, 64);
-    for (int i = 0; i < 10; i++) {
-        qr(&w[0],&w[4],&w[8],&w[12]); qr(&w[1],&w[5],&w[9],&w[13]);
-        qr(&w[2],&w[6],&w[10],&w[14]); qr(&w[3],&w[7],&w[11],&w[15]);
-        qr(&w[0],&w[5],&w[10],&w[15]); qr(&w[1],&w[6],&w[11],&w[12]);
-        qr(&w[2],&w[7],&w[8],&w[13]); qr(&w[3],&w[4],&w[9],&w[14]);
-    }
-    for (int i = 0; i < 16; i++) {
-        uint32_t v = w[i] + s[i];
-        out[i * 4] = v & 0xFF;
-        out[i * 4 + 1] = (v >> 8) & 0xFF;
-        out[i * 4 + 2] = (v >> 16) & 0xFF;
-        out[i * 4 + 3] = (v >> 24) & 0xFF;
-    }
-}
-
-static void chacha20_xor(const uint8_t *src, size_t n, const uint8_t key[32],
-                         const uint8_t nonce[12], uint32_t counter, uint8_t *out) {
-    size_t off = 0;
-    while (off < n) {
-        uint8_t blk[64];
-        chacha20_block(key, counter, nonce, blk);
-        size_t r = n - off > 64 ? 64 : n - off;
-        for (size_t i = 0; i < r; i++) out[off + i] = src[off + i] ^ blk[i];
-        off += r;
-        counter++;
-    }
-}
-
-static void poly1305(const uint8_t *msg, size_t mlen, const uint8_t key[32], uint8_t tag[16]) {
-    uint32_t r0 = key[0]|((uint32_t)key[1]<<8)|((uint32_t)key[2]<<16)|((uint32_t)key[3]<<24);
-    uint32_t r1 = ((uint32_t)key[3]>>2)|((uint32_t)key[4]<<6)|((uint32_t)key[5]<<14)|((uint32_t)key[6]<<22);
-    uint32_t r2 = ((uint32_t)key[6]>>4)|((uint32_t)key[7]<<4)|((uint32_t)key[8]<<12)|((uint32_t)key[9]<<20);
-    uint32_t r3 = ((uint32_t)key[9]>>6)|((uint32_t)key[10]<<2)|((uint32_t)key[11]<<10)|((uint32_t)key[12]<<18);
-    uint32_t r4 = ((uint32_t)key[12]>>8)|((uint32_t)key[13]<<0)|((uint32_t)key[14]<<8)|((uint32_t)key[15]<<16);
-    r0 &= 0x3ffffff; r1 &= 0x3ffff03; r2 &= 0x3ffc0ff; r3 &= 0x3f03fff; r4 &= 0x00fffff;
-    uint32_t s1=r1*5, s2=r2*5, s3=r3*5, s4=r4*5;
-    uint32_t h0=0,h1=0,h2=0,h3=0,h4=0;
-    size_t off = 0;
-    while (off < mlen) {
-        uint8_t blk[16] = {0};
-        size_t r = mlen - off > 16 ? 16 : mlen - off;
-        memcpy(blk, msg + off, r);
-        uint32_t hibit = r == 16 ? (1u << 24) : 0;
-        if (r < 16) blk[r] = 1;
-        uint32_t t0=blk[0]|((uint32_t)blk[1]<<8)|((uint32_t)blk[2]<<16)|((uint32_t)blk[3]<<24);
-        uint32_t t1=((uint32_t)blk[3]>>2)|((uint32_t)blk[4]<<6)|((uint32_t)blk[5]<<14)|((uint32_t)blk[6]<<22);
-        uint32_t t2=((uint32_t)blk[6]>>4)|((uint32_t)blk[7]<<4)|((uint32_t)blk[8]<<12)|((uint32_t)blk[9]<<20);
-        uint32_t t3=((uint32_t)blk[9]>>6)|((uint32_t)blk[10]<<2)|((uint32_t)blk[11]<<10)|((uint32_t)blk[12]<<18);
-        uint32_t t4=((uint32_t)blk[12]>>8)|((uint32_t)blk[13]<<0)|((uint32_t)blk[14]<<8)|((uint32_t)blk[15]<<16);
-        h0+=t0&0x3ffffff; h1+=t1&0x3ffffff; h2+=t2&0x3ffffff;
-        h3+=t3&0x3ffffff; h4+=(t4&0x3ffffff)+hibit;
-        uint64_t d0=(uint64_t)h0*r0+(uint64_t)h1*s4+(uint64_t)h2*s3+(uint64_t)h3*s2+(uint64_t)h4*s1;
-        uint64_t d1=(uint64_t)h0*r1+(uint64_t)h1*r0+(uint64_t)h2*s4+(uint64_t)h3*s3+(uint64_t)h4*s2;
-        uint64_t d2=(uint64_t)h0*r2+(uint64_t)h1*r1+(uint64_t)h2*r0+(uint64_t)h3*s4+(uint64_t)h4*s3;
-        uint64_t d3=(uint64_t)h0*r3+(uint64_t)h1*r2+(uint64_t)h2*r1+(uint64_t)h3*r0+(uint64_t)h4*s4;
-        uint64_t d4=(uint64_t)h0*r4+(uint64_t)h1*r3+(uint64_t)h2*r2+(uint64_t)h3*r1+(uint64_t)h4*r0;
-        h0=(uint32_t)d0&0x3ffffff; d1+=d0>>26;
-        h1=(uint32_t)d1&0x3ffffff; d2+=d1>>26;
-        h2=(uint32_t)d2&0x3ffffff; d3+=d2>>26;
-        h3=(uint32_t)d3&0x3ffffff; d4+=d3>>26;
-        h4=(uint32_t)d4&0x3ffffff; h0+=(uint32_t)(d4>>26)*5;
-        h1+=h0>>26; h0&=0x3ffffff;
-        off += r;
-    }
-    h2+=h1>>26; h1&=0x3ffffff;
-    h3+=h2>>26; h2&=0x3ffffff;
-    h4+=h3>>26; h3&=0x3ffffff;
-    h0+=(h4>>26)*5; h4&=0x3ffffff;
-    h1+=h0>>26; h0&=0x3ffffff;
-    uint32_t g0=h0+5,g1=h1,g2=h2,g3=h3,g4=h4;
-    g1+=g0>>26; g0&=0x3ffffff;
-    g2+=g1>>26; g1&=0x3ffffff;
-    g3+=g2>>26; g2&=0x3ffffff;
-    g4+=g3>>26; g3&=0x3ffffff;
-    g4-=1u<<26;
-    if(!(g4>>31)){h0=g0;h1=g1;h2=g2;h3=g3;h4=g4;}
-    uint32_t f0=(h0|(h1<<26))&0xffffffff;
-    uint32_t f1=((h1>>6)|(h2<<20))&0xffffffff;
-    uint32_t f2=((h2>>12)|(h3<<14))&0xffffffff;
-    uint32_t f3=((h3>>18)|(h4<<8))&0xffffffff;
-    uint32_t k0=key[16]|(key[17]<<8)|(key[18]<<16)|(key[19]<<24);
-    uint32_t k1=key[20]|(key[21]<<8)|(key[22]<<16)|(key[23]<<24);
-    uint32_t k2=key[24]|(key[25]<<8)|(key[26]<<16)|(key[27]<<24);
-    uint32_t k3=key[28]|(key[29]<<8)|(key[30]<<16)|(key[31]<<24);
-    uint64_t ff0=f0,ff1=f1,ff2=f2,ff3=f3;
-    ff0+=k0; ff1+=k1+(ff0>>32); ff0&=0xffffffff;
-    ff2+=k2+(ff1>>32); ff1&=0xffffffff;
-    ff3+=k3+(ff2>>32); ff2&=0xffffffff; ff3&=0xffffffff;
-    f0=(uint32_t)ff0; f1=(uint32_t)ff1; f2=(uint32_t)ff2; f3=(uint32_t)ff3;
-    tag[0]=(uint8_t)f0;tag[1]=(uint8_t)(f0>>8);tag[2]=(uint8_t)(f0>>16);tag[3]=(uint8_t)(f0>>24);
-    tag[4]=(uint8_t)f1;tag[5]=(uint8_t)(f1>>8);tag[6]=(uint8_t)(f1>>16);tag[7]=(uint8_t)(f1>>24);
-    tag[8]=(uint8_t)f2;tag[9]=(uint8_t)(f2>>8);tag[10]=(uint8_t)(f2>>16);tag[11]=(uint8_t)(f2>>24);
-    tag[12]=(uint8_t)f3;tag[13]=(uint8_t)(f3>>8);tag[14]=(uint8_t)(f3>>16);tag[15]=(uint8_t)(f3>>24);
-}
-
-static void build_poly1305_data(const uint8_t *aad, size_t aad_len,
-                                const uint8_t *ct, size_t ct_len,
-                                uint8_t *out, size_t out_cap, size_t *out_len) {
-    size_t off = 0;
-    size_t need = aad_len + 16 + ct_len + 16 + 16;
-    if (need > out_cap) { *out_len = 0; return; }
-    if (aad_len > 0 && aad) {
-        memcpy(out + off, aad, aad_len);
-        off += aad_len;
-        if (aad_len % 16 != 0) {
-            size_t pad = 16 - (aad_len % 16);
-            memset(out + off, 0, pad);
-            off += pad;
-        }
-    }
-    if (ct_len > 0 && ct) {
-        memcpy(out + off, ct, ct_len);
-        off += ct_len;
-    }
-    if (ct_len % 16 != 0) {
-        size_t pad = 16 - (ct_len % 16);
-        memset(out + off, 0, pad);
-        off += pad;
-    }
-    uint64_t aad_len64 = aad_len;
-    uint64_t ct_len64 = ct_len;
-    for (int i = 0; i < 8; i++) {
-        out[off + i] = (uint8_t)((aad_len64 >> (i * 8)) & 0xFF);
-        out[off + 8 + i] = (uint8_t)((ct_len64 >> (i * 8)) & 0xFF);
-    }
-    off += 16;
-    *out_len = off;
-}
-
-#define AEAD_STACK_BUF_SIZE 256
-
-static int aead_open(const uint8_t *ct, size_t ctlen, const uint8_t key[32],
-                     const uint8_t nonce[12], uint8_t *pt) {
-    if (ctlen < 16) return 0;
-    size_t dlen = ctlen - 16;
-    const uint8_t *tag = ct + dlen;
-    uint8_t blk0[64];
-    chacha20_block(key, 0, nonce, blk0);
-    size_t mac_buf_sz = dlen + 64 + 16;
-    uint8_t stack_buf[AEAD_STACK_BUF_SIZE];
-    uint8_t *mac_data = (mac_buf_sz <= AEAD_STACK_BUF_SIZE) ? stack_buf : (uint8_t *)malloc(mac_buf_sz);
-    if (!mac_data) return 0;
-    size_t mac_len = 0;
-    build_poly1305_data(NULL, 0, ct, dlen, mac_data, mac_buf_sz, &mac_len);
-    uint8_t expected[16];
-    poly1305(mac_data, mac_len, blk0, expected);
-    if (mac_data != stack_buf) free(mac_data);
-    {
-        volatile uint8_t diff = 0;
-        for (int ci = 0; ci < 16; ci++) diff |= tag[ci] ^ expected[ci];
-        if (diff != 0) return 0;
-    }
-    chacha20_xor(ct, dlen, key, nonce, 1, pt);
-    pt[dlen] = 0;
-    return 1;
-}
-
-static int decrypt_data(const char *b64, const uint8_t key[32], char *out, size_t out_sz) {
-    size_t b64len = strlen(b64);
-    size_t data_cap = b64len / 4 * 3 + 4;
-    uint8_t *data = (uint8_t *)malloc(data_cap);
-    size_t dlen = b64dec(b64, b64len, data);
-    if (dlen == 0) { free(data); return 0; }
-    if (dlen < 12 + 16) { free(data); return 0; }
-    uint8_t *pt = (uint8_t *)malloc(dlen);
-    int ok = aead_open(data + 12, dlen - 12, key, data, pt);
-    if (ok) {
-        size_t pt_len = dlen - 12 - 16;
-        if (pt_len >= out_sz) pt_len = out_sz - 1;
-        memcpy(out, pt, pt_len);
-        out[pt_len] = '\0';
-    }
-    free(pt);
-    free(data);
-    return ok;
-}
-
-static int get_all_macs(char macs[][32], int max_macs);
-static void mac_to_fingerprint(const char *mac, char *fp_hex);
-static void get_fingerprint(char *fp_hex);
-
-static void derive_key_legacy(const char *fp, const char *salt, uint8_t key[32]) {
-    char material[256];
-    snprintf(material, sizeof(material), "%s|%s", fp, salt);
-    sha256((const uint8_t *)material, strlen(material), key);
-}
-
-static void derive_key(const char *fp, const char *salt, uint8_t key[32]) {
-    BCRYPT_ALG_HANDLE hAlg = NULL;
-    NTSTATUS status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, NULL, BCRYPT_ALG_HANDLE_HMAC_FLAG);
-    if (!BCRYPT_SUCCESS(status)) {
-        derive_key_legacy(fp, salt, key);
-        return;
-    }
-    ULONGLONG iterations = 100000;
-    status = BCryptDeriveKeyPBKDF2(
-        hAlg,
-        (PUCHAR)fp, (ULONG)strlen(fp),
-        (PUCHAR)salt, (ULONG)strlen(salt),
-        iterations,
-        key, 32,
-        0
-    );
-    BCryptCloseAlgorithmProvider(hAlg, 0);
-    if (!BCRYPT_SUCCESS(status)) {
-        derive_key_legacy(fp, salt, key);
-    }
-}
-
-static int unprotect_data_dpapi(const uint8_t *ciphertext, DWORD cipher_len,
-                                 const char *entropy,
-                                 uint8_t **out, DWORD *out_len) {
-    DATA_BLOB data_in = { cipher_len, (BYTE *)ciphertext };
-    DATA_BLOB data_out = { 0, NULL };
-    DATA_BLOB entropy_blob = { 0, NULL };
-    if (entropy && entropy[0]) {
-        entropy_blob.cbData = (DWORD)strlen(entropy);
-        entropy_blob.pbData = (BYTE *)entropy;
-    }
-    DWORD flags = CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN;
-    BOOL result = CryptUnprotectData(
-        &data_in, NULL,
-        entropy ? &entropy_blob : NULL,
-        NULL, NULL, flags, &data_out
-    );
-    if (result) {
-        *out = data_out.pbData;
-        *out_len = data_out.cbData;
-        return 1;
-    }
-    return 0;
-}
-
 static int decrypt_credentials_from_json(const char *json, const uint8_t key[32],
                                           char *user, size_t user_sz,
                                           char *pass, size_t pass_sz,
@@ -886,20 +267,6 @@ static int load_encrypted_credentials(char *user, size_t user_sz, char *pass, si
     log_line("所有指纹均无法解密配置");
     return 0;
 }
-
-static void desktop_free(Desktop *d) {
-    free(d->connect_msg); d->connect_msg = NULL;
-    free(d->ws_uri); d->ws_uri = NULL;
-    free(d->host); d->host = NULL;
-    free(d->port); d->port = NULL;
-    free(d->clink_host); d->clink_host = NULL;
-    free(d->ca_cert); d->ca_cert = NULL;
-    free(d->client_cert); d->client_cert = NULL;
-    free(d->client_key); d->client_key = NULL;
-    free(d->token); d->token = NULL;
-    free(d->tenant_account); d->tenant_account = NULL;
-}
-
 static void desktop_prepare(Desktop *d) {
     if (!d->connect_msg && d->ca_cert) {
         const char *msg_host = d->host ? d->host : "";
@@ -944,987 +311,12 @@ static void desktop_prepare(Desktop *d) {
         }
     }
 }
-
-static int http_init(void) {
-    g_inet = WinHttpOpen(L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
-                          WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!g_inet) return 0;
-    WinHttpSetTimeouts(g_inet, DNS_RESOLVE_TIMEOUT_MS, WINHTTP_CONNECT_TIMEOUT_MS, WINHTTP_SEND_TIMEOUT_MS, WINHTTP_RECEIVE_TIMEOUT_MS);
-    return 1;
-}
-
-static int http_req(const char *method, const char *url, const char *body, size_t blen,
-                    const char *ct, const char **hdrs, int nhdrs,
-                    char *resp, size_t rsz) {
-    URL_COMPONENTS uc = {0};
-    uc.dwStructSize = sizeof(uc);
-    WCHAR whostname[256], wurl_path[2048];
-    uc.lpszHostName = whostname; uc.dwHostNameLength = sizeof(whostname)/sizeof(WCHAR);
-    uc.lpszUrlPath = wurl_path; uc.dwUrlPathLength = sizeof(wurl_path)/sizeof(WCHAR);
-    WCHAR wurl[4096];
-    MultiByteToWideChar(CP_ACP, 0, url, -1, wurl, 4096);
-    if (!WinHttpCrackUrl(wurl, 0, 0, &uc)) {
-        log_line("URL解析失败: %s", url);
-        return -1;
-    }
-    WCHAR wmethod[16] = {0};
-    MultiByteToWideChar(CP_ACP, 0, method, -1, wmethod, 16);
-
-    HINTERNET hconn = WinHttpConnect(g_inet, whostname, (INTERNET_PORT)uc.nPort, 0);
-    if (!hconn) {
-        char hname[256];
-        WideCharToMultiByte(CP_ACP, 0, whostname, -1, hname, sizeof(hname), NULL, NULL);
-        log_line("连接服务器失败: %s:%d 错误=%lu", hname, uc.nPort, GetLastError());
-        return -1;
-    }
-
-    DWORD flags = WINHTTP_FLAG_REFRESH;
-    if (uc.nScheme == INTERNET_SCHEME_HTTPS) flags |= WINHTTP_FLAG_SECURE;
-    HINTERNET hreq = WinHttpOpenRequest(hconn, wmethod, wurl_path, NULL, WINHTTP_NO_REFERER,
-                                         WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-    if (!hreq) {
-        log_line("创建HTTP请求失败: 错误=%lu", GetLastError());
-        WinHttpCloseHandle(hconn);
-        return -1;
-    }
-
-    if (uc.nScheme == INTERNET_SCHEME_HTTPS) {
-        DWORD opt = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
-                    SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
-        WinHttpSetOption(hreq, WINHTTP_OPTION_SECURITY_FLAGS, &opt, sizeof(opt));
-    }
-
-    for (int i = 0; i < nhdrs; i++) {
-        WCHAR whdr[512];
-        MultiByteToWideChar(CP_ACP, 0, hdrs[i], -1, whdr, 512);
-        WinHttpAddRequestHeaders(hreq, whdr, (ULONG)-1, WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-    }
-
-    if (ct) {
-        char h[256]; snprintf(h, sizeof(h), "Content-Type: %s", ct);
-        WCHAR wh[256]; MultiByteToWideChar(CP_ACP, 0, h, -1, wh, 256);
-        WinHttpAddRequestHeaders(hreq, wh, (ULONG)-1, WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-    }
-
-    if (!WinHttpSendRequest(hreq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, (void *)body, (DWORD)blen, (DWORD)blen, 0)) {
-        log_line("发送HTTP请求失败: 错误=%lu", GetLastError());
-        WinHttpCloseHandle(hreq); WinHttpCloseHandle(hconn);
-        return -1;
-    }
-
-    if (!WinHttpReceiveResponse(hreq, NULL)) {
-        log_line("接收HTTP响应失败: 错误=%lu", GetLastError());
-        WinHttpCloseHandle(hreq); WinHttpCloseHandle(hconn);
-        return -1;
-    }
-
-    DWORD total = 0, n;
-    while (WinHttpReadData(hreq, resp + total, (DWORD)(rsz - total - 1), &n) && n > 0) {
-        total += n;
-        if (total >= rsz - 1) break;
-    }
-    resp[total] = 0;
-
-    WinHttpCloseHandle(hreq);
-    WinHttpCloseHandle(hconn);
-    return (int)total;
-}
-
-static int http_get_binary(const char *url, const char **hdrs, int nhdrs,
-                           uint8_t *resp, size_t rsz) {
-    URL_COMPONENTS uc = {0};
-    uc.dwStructSize = sizeof(uc);
-    WCHAR whostname[256], wurl_path[2048];
-    uc.lpszHostName = whostname; uc.dwHostNameLength = sizeof(whostname)/sizeof(WCHAR);
-    uc.lpszUrlPath = wurl_path; uc.dwUrlPathLength = sizeof(wurl_path)/sizeof(WCHAR);
-    WCHAR wurl[4096];
-    MultiByteToWideChar(CP_ACP, 0, url, -1, wurl, 4096);
-    if (!WinHttpCrackUrl(wurl, 0, 0, &uc)) return -1;
-
-    HINTERNET hconn = WinHttpConnect(g_inet, whostname, (INTERNET_PORT)uc.nPort, 0);
-    if (!hconn) return -1;
-    DWORD flags = WINHTTP_FLAG_REFRESH;
-    if (uc.nScheme == INTERNET_SCHEME_HTTPS) flags |= WINHTTP_FLAG_SECURE;
-    HINTERNET hreq = WinHttpOpenRequest(hconn, L"GET", wurl_path, NULL, WINHTTP_NO_REFERER,
-                                         WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-    if (!hreq) { WinHttpCloseHandle(hconn); return -1; }
-    if (uc.nScheme == INTERNET_SCHEME_HTTPS) {
-        DWORD opt = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
-                    SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
-        WinHttpSetOption(hreq, WINHTTP_OPTION_SECURITY_FLAGS, &opt, sizeof(opt));
-    }
-    for (int i = 0; i < nhdrs; i++) {
-        WCHAR whdr[512]; MultiByteToWideChar(CP_ACP, 0, hdrs[i], -1, whdr, 512);
-        WinHttpAddRequestHeaders(hreq, whdr, (ULONG)-1, WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-    }
-    if (!WinHttpSendRequest(hreq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
-        WinHttpCloseHandle(hreq); WinHttpCloseHandle(hconn); return -1;
-    }
-    if (!WinHttpReceiveResponse(hreq, NULL)) {
-        WinHttpCloseHandle(hreq); WinHttpCloseHandle(hconn); return -1;
-    }
-    DWORD total = 0, n;
-    while (WinHttpReadData(hreq, resp + total, (DWORD)(rsz - total), &n) && n > 0) {
-        total += n;
-        if (total >= rsz) break;
-    }
-    WinHttpCloseHandle(hreq);
-    WinHttpCloseHandle(hconn);
-    return (int)total;
-}
-
-static __declspec(thread) char g_bh1[64], g_bh2[64], g_bh3[128], g_bh5[64], g_bh6[256];
-static void make_base_headers(const Session *s, const char **hdrs, int *nhdrs) {
-    snprintf(g_bh1, sizeof(g_bh1), "ctg-devicetype: 60");
-    snprintf(g_bh2, sizeof(g_bh2), "ctg-version: 103020001");
-    snprintf(g_bh3, sizeof(g_bh3), "ctg-devicecode: %s", s->device_code);
-    snprintf(g_bh5, sizeof(g_bh5), "referer: https://pc.ctyun.cn/");
-    snprintf(g_bh6, sizeof(g_bh6), "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36");
-    hdrs[0] = g_bh6; hdrs[1] = g_bh1; hdrs[2] = g_bh2; hdrs[3] = g_bh3; hdrs[4] = g_bh5;
-    *nhdrs = 5;
-}
-
-static __declspec(thread) char g_sh1[64], g_sh2[64], g_sh3[128], g_sh4[64], g_sh5[64], g_sh6[64], g_sh7[256];
-static __declspec(thread) char g_shts[64], g_shri[64], g_shsig[128];
-static __declspec(thread) char g_shcombined[512], g_shsig_hex[33];
-static void make_sig_headers(const Session *s, const char **hdrs, int *nhdrs) {
-    snprintf(g_sh1, sizeof(g_sh1), "ctg-devicetype: 60");
-    snprintf(g_sh2, sizeof(g_sh2), "ctg-version: 103020001");
-    snprintf(g_sh3, sizeof(g_sh3), "ctg-devicecode: %s", s->device_code);
-    snprintf(g_sh5, sizeof(g_sh5), "referer: https://pc.ctyun.cn/");
-    snprintf(g_sh7, sizeof(g_sh7), "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36");
-    long long ts = (long long)time(NULL) * 1000LL;
-    snprintf(g_sh4, sizeof(g_sh4), "ctg-userid: %d", s->user_id);
-    snprintf(g_sh6, sizeof(g_sh6), "ctg-tenantid: %d", s->tenant_id);
-    snprintf(g_shts, sizeof(g_shts), "ctg-timestamp: %lld", ts);
-    snprintf(g_shri, sizeof(g_shri), "ctg-requestid: %lld", ts);
-    snprintf(g_shcombined, sizeof(g_shcombined), "60%lld%d%lld%d103020001%s",
-             ts, s->tenant_id, ts, s->user_id, s->secret_key);
-    md5_hex(g_shcombined, g_shsig_hex);
-    snprintf(g_shsig, sizeof(g_shsig), "ctg-signaturestr: %s", g_shsig_hex);
-    hdrs[0] = g_sh7; hdrs[1] = g_sh1; hdrs[2] = g_sh2; hdrs[3] = g_sh3; hdrs[4] = g_sh5;
-    hdrs[5] = g_sh4; hdrs[6] = g_sh6; hdrs[7] = g_shts; hdrs[8] = g_shri; hdrs[9] = g_shsig;
-    *nhdrs = 10;
-}
-
-static int api_post_noauth(const Session *s, const char *url, const char *body, size_t blen,
-                           const char *ct, char *resp, size_t rsz) {
-    const char *hdrs[16];
-    int nhdrs = 0;
-    make_base_headers(s, hdrs, &nhdrs);
-    return http_req("POST", url, body, blen, ct, hdrs, nhdrs, resp, rsz);
-}
-
-static int api_post(const Session *s, const char *url, const char *body, size_t blen,
-                    const char *ct, char *resp, size_t rsz) {
-    const char *hdrs[16];
-    int nhdrs = 0;
-    make_sig_headers(s, hdrs, &nhdrs);
-    return http_req("POST", url, body, blen, ct, hdrs, nhdrs, resp, rsz);
-}
-
-static int api_get_binary(const Session *s, const char *url, uint8_t *resp, size_t rsz) {
-    const char *hdrs[16];
-    int nhdrs = 0;
-    make_sig_headers(s, hdrs, &nhdrs);
-    return http_get_binary(url, hdrs, nhdrs, resp, rsz);
-}
-
-/* 带签名头的 GET 请求(返回文本 JSON)。仅用于测试验证积分任务进度。 */
 static int api_get_text(const Session *s, const char *url, char *resp, size_t rsz) {
     const char *hdrs[16];
     int nhdrs = 0;
     make_sig_headers(s, hdrs, &nhdrs);
     return http_req("GET", url, NULL, 0, NULL, hdrs, nhdrs, resp, rsz);
 }
-
-static int read_manual_captcha(char *out, size_t out_sz) {
-    printf("请输入验证码："); fflush(stdout);
-    if (!fgets(out, (int)out_sz, stdin)) return 0;
-    out[strcspn(out, "\r\n")] = 0;
-    return out[0] ? 1 : 0;
-}
-
-static int try_captcha_ocr(const Session *s, const char *user,
-                           char *captcha_out, size_t co_sz,
-                           uint8_t **img_out, int *img_len_out) {
-    char captcha_url[512];
-    long long t = (long long)time(NULL) * 1000LL;
-
-    if (user) {
-        snprintf(captcha_url, sizeof(captcha_url),
-                 "https://desk.ctyun.cn:8810/api/auth/client/captcha?height=36&width=85&userInfo=%s&mode=auto&_t=%lld",
-                 user, t);
-    } else {
-        snprintf(captcha_url, sizeof(captcha_url),
-                 "https://desk.ctyun.cn:8810/api/auth/client/validateCode/captcha?width=120&height=40&_t=%lld", t);
-    }
-
-    uint8_t *img = (uint8_t *)malloc(CAPTCHA_IMG_BUF);
-    int img_len;
-    if (user) {
-        const char *hdrs[16];
-        int nhdrs = 0;
-        make_base_headers(s, hdrs, &nhdrs);
-        img_len = http_get_binary(captcha_url, hdrs, nhdrs, img, CAPTCHA_IMG_BUF);
-    } else {
-        img_len = api_get_binary(s, captcha_url, img, CAPTCHA_IMG_BUF);
-    }
-    if (img_len <= 0) {
-        log_line("验证码图片下载失败");
-        free(img);
-        return 0;
-    }
-
-    *img_out = img;
-    *img_len_out = img_len;
-
-    size_t b64_cap = ((img_len + 2) / 3 * 4 + 1);
-    char *img_b64 = (char *)malloc(b64_cap);
-    b64enc(img, img_len, img_b64);
-
-    char boundary[64];
-    snprintf(boundary, sizeof(boundary), "----ctyun%08x", (unsigned)GetTickCount());
-    size_t b64len = strlen(img_b64);
-    size_t body_len = 256 + b64len;
-    char *body = (char *)malloc(body_len);
-    int blen = snprintf(body, body_len,
-        "--%s\r\n"
-        "Content-Disposition: form-data; name=\"image\"\r\n\r\n"
-        "%s\r\n"
-        "--%s--\r\n",
-        boundary, img_b64, boundary);
-    free(img_b64);
-
-    char ct_hdr[256];
-    snprintf(ct_hdr, sizeof(ct_hdr), "multipart/form-data; boundary=%s", boundary);
-    const char *ocr_hdrs[16];
-    int nhdrs = 0;
-    make_base_headers(s, ocr_hdrs, &nhdrs);
-    char orc_resp[OCR_RESP_BUF];
-    int rlen = http_req("POST", OCR_SERVICE_URL, body, blen, ct_hdr, ocr_hdrs, nhdrs, orc_resp, sizeof(orc_resp));
-    free(body);
-    if (rlen <= 0) {
-        log_line("OCR接口连接失败");
-        return 1;
-    }
-    orc_resp[rlen] = 0;
-
-    jstr(orc_resp, "data", captcha_out, co_sz);
-    if (!captcha_out[0]) {
-        log_line("OCR识别结果为空");
-        return 1;
-    }
-    log_line("OCR识别成功: %s", captcha_out);
-    return 2;
-}
-
-static int do_login_send(Session *s, const char *user, const char *final_sha, const char *sha2_pwd,
-                         const char *cid, const char *captcha, char *resp, size_t resp_sz) {
-    char enc_cid[512], enc_dc[512];
-    url_encode(cid, enc_cid, sizeof(enc_cid));
-    url_encode(s->device_code, enc_dc, sizeof(enc_dc));
-
-    char post[4096];
-    snprintf(post, sizeof(post),
-             "userAccount=%s&password=%s&sha256Password=%s&challengeId=%s&captchaCode=%s"
-             "&deviceCode=%s&deviceName=Chrome%%E6%%B5%%8F%%E8%%A7%%88%%E5%%99%%A8&deviceType=60"
-             "&deviceModel=Windows+NT+10.0%%3B+Win64%%3B+x64&appVersion=3.2.0"
-             "&sysVersion=Windows+NT+10.0%%3B+Win64%%3B+x64&clientVersion=103020001",
-             user, final_sha, sha2_pwd, enc_cid, captcha, enc_dc);
-
-    if (api_post_noauth(s, "https://desk.ctyun.cn:8810/api/auth/client/login",
-                        post, strlen(post), "application/x-www-form-urlencoded",
-                        resp, (int)resp_sz) < 0) {
-        return -2;
-    }
-
-    int code = jint(resp, "code");
-    if (code != 0) {
-        char msg[256];
-        jstr(resp, "msg", msg, sizeof(msg));
-        if (strcmp(msg, "\xe7\x94\xa8\xe6\x88\xb7\xe5\x90\x8d\xe6\x88\x96\xe5\xaf\x86\xe7\xa0\x81\xe9\x94\x99\xe8\xaf\xaf") == 0) {
-            return -1;
-        }
-        return 0;
-    }
-
-    const char *data_start = strstr(resp, "\"data\"");
-    if (!data_start) return 0;
-    data_start = strchr(data_start, '{');
-    if (!data_start) return 0;
-
-    const char *vstart;
-    int vlen;
-    char vtype;
-
-    if (json_find_key(data_start, "secretKey", &vstart, &vlen, &vtype) && vtype == 's') {
-        int copy_len = vlen < (int)sizeof(s->secret_key) - 1 ? vlen : (int)sizeof(s->secret_key) - 1;
-        memcpy(s->secret_key, vstart, copy_len);
-        s->secret_key[copy_len] = 0;
-    }
-    if (json_find_key(data_start, "userAccount", &vstart, &vlen, &vtype) && vtype == 's') {
-        int copy_len = vlen < (int)sizeof(s->user_account) - 1 ? vlen : (int)sizeof(s->user_account) - 1;
-        memcpy(s->user_account, vstart, copy_len);
-        s->user_account[copy_len] = 0;
-    }
-    if (json_find_key(data_start, "userId", &vstart, &vlen, &vtype) && vtype == 'n') {
-        char num_buf[32];
-        int copy_len = vlen < 31 ? vlen : 31;
-        memcpy(num_buf, vstart, copy_len);
-        num_buf[copy_len] = 0;
-        s->user_id = atoi(num_buf);
-    }
-    if (json_find_key(data_start, "tenantId", &vstart, &vlen, &vtype) && vtype == 'n') {
-        char num_buf[32];
-        int copy_len = vlen < 31 ? vlen : 31;
-        memcpy(num_buf, vstart, copy_len);
-        num_buf[copy_len] = 0;
-        s->tenant_id = atoi(num_buf);
-    }
-
-    s->logged_in = s->secret_key[0] ? 1 : 0;
-    SecureZeroMemory(post, sizeof(post));
-    if (getenv("CTYUN_DUMP_AUTH")) {
-        char tmp[MAX_PATH], full[MAX_PATH];
-        GetTempPathA(MAX_PATH, tmp);
-        snprintf(full, sizeof(full), "%sctyun_auth_debug.json", tmp);
-        FILE *df = fopen(full, "wb");
-        if (df) {
-            fprintf(df, "{\"device_code\":\"%s\",\"login_resp\":%s}\n", s->device_code, resp);
-            fclose(df);
-            log_line("[dumpauth] 已转储登录响应到 %s", full);
-        }
-    }
-    return 1;
-}
-
-static int manual_captcha_mode(void) {
-    const char *v = getenv("CTYUN_MANUAL_CAPTCHA");
-    return (v && v[0] == '1') ? 1 : 0;
-}
-
-static int do_login(Session *s, const char *user, const char *pwd) {
-    uint8_t *img_data = NULL;
-    int img_len = 0;
-    char *resp = (char *)malloc(MAX_RESP);
-    if (!resp) return 0;
-
-    int manual_mode = manual_captcha_mode();
-    int max_attempts = manual_mode ? MAX_MANUAL_CAPTCHA_ATTEMPTS : MAX_LOGIN_ATTEMPTS;
-
-    for (int attempt = 1; attempt <= max_attempts; attempt++) {
-        if (api_post_noauth(s, "https://desk.ctyun.cn:8810/api/auth/client/genChallengeData",
-                            "{}", 2, "application/json", resp, MAX_RESP) < 0) {
-            log_line("获取挑战码失败 (尝试%d)", attempt);
-            continue;
-        }
-        int code = jint(resp, "code");
-        if (code != 0) {
-            char msg[256];
-            jstr(resp, "msg", msg, sizeof(msg));
-            log_line("获取挑战码错误: %s", msg);
-            continue;
-        }
-        char cid[128], ccode[128];
-        jstr(resp, "challengeId", cid, sizeof(cid));
-        jstr(resp, "challengeCode", ccode, sizeof(ccode));
-        if (!cid[0]) { log_line("挑战码为空"); continue; }
-
-        char final_sha[65], sha2_pwd[65];
-        {
-            char combined[512];
-            snprintf(combined, sizeof(combined), "%s%s", pwd, ccode);
-            sha256_hex(combined, final_sha);
-            char pwd_sha[65];
-            sha256_hex(pwd, pwd_sha);
-            char sha2_combined[512];
-            snprintf(sha2_combined, sizeof(sha2_combined), "%s%s", pwd_sha, ccode);
-            sha256_hex(sha2_combined, sha2_pwd);
-        }
-
-        char captcha[64] = "";
-
-        if (manual_mode) {
-            try_captcha_ocr(s, user, captcha, sizeof(captcha), &img_data, &img_len);
-            printf("验证码图片已获取，请查看后输入验证码\n");
-            if (img_data && img_len > 0) {
-                char tmp_path[MAX_PATH];
-                GetTempPathA(MAX_PATH, tmp_path);
-                char img_path[MAX_PATH];
-                snprintf(img_path, sizeof(img_path), "%sctyun_captcha.png", tmp_path);
-                FILE *f = fopen(img_path, "wb");
-                if (f) {
-                    fwrite(img_data, 1, img_len, f);
-                    fclose(f);
-                    ShellExecuteA(NULL, "open", img_path, NULL, NULL, SW_SHOW);
-                    log_line("验证码已保存到: %s 并已打开", img_path);
-                }
-            }
-            if (!read_manual_captcha(captcha, sizeof(captcha))) {
-                log_line("验证码输入为空 (尝试%d)", attempt);
-                if (img_data) { free(img_data); img_data = NULL; }
-                continue;
-            }
-        } else {
-            int ocr_result = try_captcha_ocr(s, user, captcha, sizeof(captcha), &img_data, &img_len);
-            if (ocr_result < 2) {
-                log_line("OCR识别失败，切换手工输入");
-                if (img_data) { free(img_data); img_data = NULL; }
-                if (!read_manual_captcha(captcha, sizeof(captcha))) {
-                    log_line("验证码输入为空 (尝试%d)", attempt);
-                    continue;
-                }
-            }
-        }
-
-        log_line("正在发送登录请求 (尝试%d)...", attempt);
-        int result = do_login_send(s, user, final_sha, sha2_pwd, cid, captcha, resp, MAX_RESP);
-        SecureZeroMemory(final_sha, sizeof(final_sha));
-        SecureZeroMemory(sha2_pwd, sizeof(sha2_pwd));
-        if (img_data) { free(img_data); img_data = NULL; }
-        if (result == 1) {
-            log_line("登录成功: userId=%d, tenantId=%d", s->user_id, s->tenant_id);
-            free(resp);
-            return 1;
-        }
-        if (result == -1) {
-            log_line("用户名或密码错误");
-            free(resp);
-            return 0;
-        }
-    }
-
-    log_line("登录失败，验证码错误次数过多");
-    free(resp);
-    return 0;
-}
-
-static int get_desktop_list(Session *s, Desktop *desktops, int max) {
-    char *resp = (char *)malloc(MAX_RESP);
-    if (!resp) return 0;
-    char body[] = "{\"getCnt\":20,\"desktopTypes\":[\"1\",\"2001\",\"2002\",\"2003\"],\"sortType\":\"createTimeV1\"}";
-    if (api_post(s, "https://desk.ctyun.cn:8810/api/desktop/client/pageDesktop",
-                 body, strlen(body), "application/json", resp, MAX_RESP) < 0) {
-        log_line("获取桌面列表请求失败");
-        free(resp);
-        return 0;
-    }
-    if (jint(resp, "code") != 0) {
-        log_line("获取桌面列表错误: code=%d", jint(resp, "code"));
-        free(resp);
-        return 0;
-    }
-    log_line("获取桌面列表成功，正在解析桌面信息");
-
-    const char *dl = strstr(resp, "\"desktopList\"");
-    if (!dl) { free(resp); return 0; }
-    dl = strchr(dl, '[');
-    if (!dl) { free(resp); return 0; }
-
-    int count = 0;
-    const char *p = dl;
-    while (count < max) {
-        const char *obj = strchr(p, '{');
-        if (!obj) break;
-        const char *end = find_matching_brace(obj);
-        if (!end) break;
-
-        jstr_range_impl(obj, end + 1, "desktopId", desktops[count].desktop_id, sizeof(desktops[count].desktop_id));
-        if (!desktops[count].desktop_id[0])
-            jstr_range_impl(obj, end + 1, "objId", desktops[count].desktop_id, sizeof(desktops[count].desktop_id));
-        jstr_range_impl(obj, end + 1, "desktopCode", desktops[count].desktop_code, sizeof(desktops[count].desktop_code));
-        char status[64];
-        jstr_range_impl(obj, end + 1, "useStatusText", status, sizeof(status));
-        desktops[count].is_active = (strcmp(status, "\xe8\xbf\x90\xe8\xa1\x8c\xe4\xb8\xad") == 0);
-        desktops[count].host = NULL;
-        desktops[count].port = NULL;
-        desktops[count].clink_host = NULL;
-        desktops[count].ca_cert = NULL;
-        desktops[count].client_cert = NULL;
-        desktops[count].client_key = NULL;
-        desktops[count].token = NULL;
-        desktops[count].tenant_account = NULL;
-        desktops[count].connect_msg = NULL;
-        desktops[count].ws_uri = NULL;
-
-        log_line("桌面[%d]: id=%s code=%s 状态=%s 运行中=%d",
-                 count, desktops[count].desktop_id, desktops[count].desktop_code,
-                 status, desktops[count].is_active);
-        count++;
-        p = end + 1;
-    }
-
-    free(resp);
-    return count;
-}
-
-static char *jstr_range_impl(const char *start, const char *end, const char *k, char *buf, size_t bsz) {
-    if (strlen(k) > 120) { buf[0] = 0; return buf; }
-    char srch[128];
-    snprintf(srch, sizeof(srch), "\"%s\"", k);
-    const char *key_start = start;
-    const char *p = NULL;
-    size_t nlen = strlen(srch);
-    for (const char *cp = start; cp + nlen <= end; cp++) {
-        if (*cp == srch[0] && memcmp(cp, srch, nlen) == 0) {
-            p = cp + nlen;
-            break;
-        }
-    }
-    if (!p) { buf[0] = 0; return buf; }
-    while (p < end && (*p == ' ' || *p == ':')) p++;
-    if (p >= end || *p != '"') { buf[0] = 0; return buf; }
-    p++;
-    size_t i = 0;
-    while (p < end && *p && *p != '"' && i < bsz - 1) {
-        if (*p == '\\' && (p + 1) < end) {
-            p++;
-            switch (*p) {
-                case 'n': buf[i++] = '\n'; break;
-                case 't': buf[i++] = '\t'; break;
-                case 'r': buf[i++] = '\r'; break;
-                case '"': buf[i++] = '"';  break;
-                case '\\': buf[i++] = '\\'; break;
-                case '/': buf[i++] = '/';  break;
-                default:  buf[i++] = *p;   break;
-            }
-            p++;
-        } else {
-            buf[i++] = *p++;
-        }
-    }
-    buf[i] = 0;
-    return buf;
-}
-
-static int connect_desktop(Session *s, Desktop *d) {
-    char post[4096];
-    snprintf(post, sizeof(post),
-             "objId=%s&objType=0&osType=15&deviceId=60&vdCommand=&ipAddress=&macAddress="
-             "&deviceCode=%s&deviceName=Chrome%%E6%%B5%%8F%%E8%%A7%%88%%E5%%99%%A8&deviceType=60"
-             "&deviceModel=Windows+NT+10.0%%3B+Win64%%3B+x64&appVersion=3.2.0"
-             "&sysVersion=Windows+NT+10.0%%3B+Win64%%3B+x64&clientVersion=103020001",
-             d->desktop_id, s->device_code);
-
-    char *resp = (char *)malloc(MAX_RESP);
-    if (!resp) return 0;
-    if (api_post(s, "https://desk.ctyun.cn:8810/api/desktop/client/connect",
-                 post, strlen(post), "application/x-www-form-urlencoded",
-                 resp, MAX_RESP) < 0) {
-        log_line("连接桌面请求失败: %s", d->desktop_id);
-        free(resp);
-        return 0;
-    }
-
-    if (jint(resp, "code") != 0) {
-        char msg[256];
-        jstr(resp, "msg", msg, sizeof(msg));
-        log_line("连接桌面错误 [%s]: %s", d->desktop_id, msg);
-        free(resp);
-        return 0;
-    }
-
-    static const char *info_keys[] = { "desktopInfo", "shadowDesktopInfo", "desktopAnywhereInfo" };
-    char tmp[16384];
-
-    for (int ki = 0; ki < 3; ki++) {
-        char key_pattern[64];
-        snprintf(key_pattern, sizeof(key_pattern), "\"%s\"", info_keys[ki]);
-        const char *di = strstr(resp, key_pattern);
-        if (!di) continue;
-        di = strchr(di, '{');
-        if (!di) continue;
-        const char *di_end = find_matching_brace(di);
-        if (!di_end) continue;
-
-        jstr_range_impl(di, di_end + 1, "host", tmp, sizeof(tmp));
-        d->host = str_dup(tmp);
-        jstr_range_impl(di, di_end + 1, "port", tmp, sizeof(tmp));
-        d->port = str_dup(tmp);
-        jstr_range_impl(di, di_end + 1, "clinkLvsOutHost", tmp, sizeof(tmp));
-        d->clink_host = str_dup(tmp);
-        jstr_range_impl(di, di_end + 1, "caCert", tmp, sizeof(tmp));
-        d->ca_cert = str_dup(tmp);
-        jstr_range_impl(di, di_end + 1, "clientCert", tmp, sizeof(tmp));
-        d->client_cert = str_dup(tmp);
-        jstr_range_impl(di, di_end + 1, "clientKey", tmp, sizeof(tmp));
-        d->client_key = str_dup(tmp);
-        jstr_range_impl(di, di_end + 1, "token", tmp, sizeof(tmp));
-        d->token = str_dup(tmp);
-        jstr_range_impl(di, di_end + 1, "tenantMemberAccount", tmp, sizeof(tmp));
-        d->tenant_account = str_dup(tmp);
-
-        log_line("[%s] 连接桌面成功: host=%s port=%s clink=%s [来源:%s]",
-                 d->desktop_code,
-                 d->host ? d->host : "", d->port ? d->port : "",
-                 d->clink_host ? d->clink_host : "", info_keys[ki]);
-
-        if (d->host && d->host[0]) break;
-
-        free(d->host); d->host = NULL;
-        free(d->port); d->port = NULL;
-        free(d->clink_host); d->clink_host = NULL;
-        free(d->ca_cert); d->ca_cert = NULL;
-        free(d->client_cert); d->client_cert = NULL;
-        free(d->client_key); d->client_key = NULL;
-        free(d->token); d->token = NULL;
-        free(d->tenant_account); d->tenant_account = NULL;
-    }
-
-    free(resp);
-    if (!d->host || !d->host[0]) {
-        desktop_free(d);
-        return 0;
-    }
-    if (!d->ca_cert || !d->client_cert || !d->client_key) {
-        desktop_free(d);
-        return 0;
-    }
-    return 1;
-}
-
-static size_t rsa_oaep_encrypt(const uint8_t *n_bytes, size_t n_len, uint32_t e_val, uint8_t *result) {
-    const uint8_t *mod_bytes = n_bytes;
-    size_t mod_len = n_len;
-    while (mod_len > 1 && mod_bytes[0] == 0) { mod_bytes++; mod_len--; }
-
-    BCRYPT_RSAKEY_BLOB rsakb = {0};
-    rsakb.Magic = BCRYPT_RSAPUBLIC_MAGIC;
-    rsakb.BitLength = (ULONG)(mod_len * 8);
-    rsakb.cbPublicExp = 3;
-    rsakb.cbModulus = (ULONG)mod_len;
-    rsakb.cbPrime1 = 0;
-    rsakb.cbPrime2 = 0;
-
-    uint8_t e_be[3] = {(uint8_t)(e_val>>16), (uint8_t)(e_val>>8), (uint8_t)(e_val)};
-
-    DWORD blob_len = sizeof(BCRYPT_RSAKEY_BLOB) + 3 + (ULONG)mod_len;
-    uint8_t *blob = (uint8_t *)malloc(blob_len);
-    memcpy(blob, &rsakb, sizeof(BCRYPT_RSAKEY_BLOB));
-    memcpy(blob + sizeof(BCRYPT_RSAKEY_BLOB), e_be, 3);
-    uint8_t *modulus = blob + sizeof(BCRYPT_RSAKEY_BLOB) + 3;
-    memcpy(modulus, mod_bytes, mod_len);
-
-    BCRYPT_KEY_HANDLE hKey = NULL;
-    NTSTATUS status = BCryptImportKeyPair(g_rsa_alg, NULL, BCRYPT_RSAPUBLIC_BLOB,
-                                           &hKey, blob, blob_len, 0);
-    free(blob);
-    if (!BCRYPT_SUCCESS(status)) {
-        log_line("RSA公钥导入失败: 0x%08X", (unsigned)status);
-        return 0;
-    }
-
-    BCRYPT_OAEP_PADDING_INFO oaep_info = {0};
-    oaep_info.pszAlgId = BCRYPT_SHA1_ALGORITHM;
-
-    uint8_t empty_msg[] = {0};
-    ULONG ct_len = 0;
-    status = BCryptEncrypt(hKey, empty_msg, 0, &oaep_info, NULL, 0,
-                           result, (ULONG)mod_len, &ct_len, BCRYPT_PAD_OAEP);
-    BCryptDestroyKey(hKey);
-
-    if (!BCRYPT_SUCCESS(status)) {
-        log_line("RSA加密失败: 0x%08X", (unsigned)status);
-        return 0;
-    }
-    return ct_len;
-}
-
-static int handle_redq(const uint8_t *msg, size_t mlen, uint8_t *resp, size_t *rlen) {
-    if (mlen < 16 || memcmp(msg, "REDQ", 4) != 0) return 0;
-    const uint8_t *key_data = msg + 16;
-    if (mlen - 16 < 166) return 0;
-
-    const uint8_t *n_source = key_data + 32;
-    const uint8_t *e_source = key_data + 163;
-    uint32_t e_val = (e_source[0]<<16)|(e_source[1]<<8)|e_source[2];
-    if (e_val == 0) return 0;
-
-    uint8_t encrypted[512];
-    size_t enc_len = rsa_oaep_encrypt(n_source, 129, e_val, encrypted);
-    if (enc_len == 0) return 0;
-
-    uint32_t auth = 1;
-    resp[0]=auth&0xFF; resp[1]=(auth>>8)&0xFF; resp[2]=(auth>>16)&0xFF; resp[3]=(auth>>24)&0xFF;
-    memcpy(resp+4, encrypted, enc_len);
-    *rlen = 4 + enc_len;
-    return 1;
-}
-
-static uint8_t initial_payload[] = {
-    0x52,0x45,0x44,0x51,0x02,0x00,0x00,
-    0x00,0x02,0x00,0x00,0x00,0x1A,0x00,0x00,
-    0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x01,
-    0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x12,
-    0x00,0x00,0x00,0x09,0x00,0x00,0x00,0x04,
-    0x08,0x00,0x00
-};
-
-typedef struct {
-    HINTERNET hSession;
-    HINTERNET hConnect;
-    HINTERNET hRequest;
-    HINTERNET hWebSocket;
-} WSConn;
-
-static int ws_connect(const char *uri, WSConn *wsc, const char *desktop_code) {
-    memset(wsc, 0, sizeof(WSConn));
-    char host[256] = "", path[2048] = "/";
-    int port = 443;
-    int use_ssl = 0;
-
-    const char *hp = strstr(uri, "://");
-    if (hp) {
-        if (_strnicmp(uri, "wss://", 6) == 0) use_ssl = 1;
-        hp += 3;
-    } else {
-        hp = uri;
-    }
-    const char *sl = strchr(hp, '/');
-    if (sl) {
-        int hlen = (int)(sl - hp);
-        if (hlen >= (int)sizeof(host)) hlen = (int)sizeof(host) - 1;
-        memcpy(host, hp, hlen); host[hlen] = 0;
-        strncpy(path, sl, sizeof(path) - 1);
-        path[sizeof(path) - 1] = '\0';
-    } else {
-        strncpy(host, hp, sizeof(host) - 1);
-        host[sizeof(host) - 1] = '\0';
-    }
-
-    char *colon = strchr(host, ':');
-    if (colon) { *colon = 0; port = atoi(colon + 1); }
-    if (use_ssl && port == 80) port = 443;
-
-    log_line("[%s] 正在连接WebSocket: host=%s port=%d ssl=%d", desktop_code, host, port, use_ssl);
-
-    wsc->hSession = WinHttpOpen(L"CtYunPoints/" APP_VERSION, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                 WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!wsc->hSession) {
-        log_line("[%s] HTTP会话创建失败: %lu", desktop_code, GetLastError());
-        return 0;
-    }
-
-    WCHAR whost[256] = {0};
-    MultiByteToWideChar(CP_ACP, 0, host, -1, whost, 256);
-    wsc->hConnect = WinHttpConnect(wsc->hSession, whost, (INTERNET_PORT)port, 0);
-    if (!wsc->hConnect) {
-        log_line("[%s] HTTP连接失败: %lu", desktop_code, GetLastError());
-        goto cleanup;
-    }
-
-    WCHAR wpath[2048] = {0};
-    MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, 2048);
-    DWORD flags = use_ssl ? WINHTTP_FLAG_SECURE : 0;
-    wsc->hRequest = WinHttpOpenRequest(wsc->hConnect, L"GET", wpath, NULL,
-                                  WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-    if (!wsc->hRequest) {
-        log_line("[%s] HTTP请求创建失败: %lu", desktop_code, GetLastError());
-        goto cleanup;
-    }
-
-    if (use_ssl) {
-        DWORD opt_flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
-                          SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
-        WinHttpSetOption(wsc->hRequest, WINHTTP_OPTION_SECURITY_FLAGS, &opt_flags, sizeof(opt_flags));
-    }
-
-    WinHttpAddRequestHeaders(wsc->hRequest, L"Origin: https://pc.ctyun.cn", (ULONG)-1,
-                              WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-    WinHttpAddRequestHeaders(wsc->hRequest, L"Sec-WebSocket-Protocol: binary", (ULONG)-1,
-                              WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
-
-    if (!WinHttpSetOption(wsc->hRequest, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0)) {
-        log_line("[%s] WebSocket升级选项设置失败: %lu", desktop_code, GetLastError());
-        goto cleanup;
-    }
-
-    if (!WinHttpSendRequest(wsc->hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                             WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
-        log_line("[%s] HTTP请求发送失败: %lu", desktop_code, GetLastError());
-        goto cleanup;
-    }
-
-    if (!WinHttpReceiveResponse(wsc->hRequest, NULL)) {
-        log_line("[%s] HTTP响应接收失败: %lu", desktop_code, GetLastError());
-        goto cleanup;
-    }
-
-    DWORD status_code = 0;
-    DWORD sc_len = sizeof(status_code);
-    WinHttpQueryHeaders(wsc->hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                        NULL, &status_code, &sc_len, NULL);
-    if (status_code != 101) {
-        log_line("[%s] WebSocket升级失败，状态码=%lu", desktop_code, status_code);
-        goto cleanup;
-    }
-
-    wsc->hWebSocket = WinHttpWebSocketCompleteUpgrade(wsc->hRequest, (DWORD_PTR)NULL);
-    if (!wsc->hWebSocket) {
-        log_line("[%s] WebSocket升级完成失败: %lu", desktop_code, GetLastError());
-        goto cleanup;
-    }
-
-    WinHttpCloseHandle(wsc->hRequest);
-    wsc->hRequest = NULL;
-
-    /* 连接建立即设置短轮询超时：挂机主循环以~300ms粒度轮转MAIN/DISPLAY/INPUTS，
-     * 保证DISPLAY视频流及时排空、clink PING及时应答、断线快速重连。 */
-    DWORD recv_timeout = WS_POLL_TIMEOUT_MS;
-    WinHttpSetOption(wsc->hWebSocket, WINHTTP_OPTION_RECEIVE_TIMEOUT, &recv_timeout, sizeof(recv_timeout));
-
-    log_line("[%s] WebSocket握手成功", desktop_code);
-    return 1;
-
-cleanup:
-    if (wsc->hRequest) { WinHttpCloseHandle(wsc->hRequest); wsc->hRequest = NULL; }
-    if (wsc->hConnect) { WinHttpCloseHandle(wsc->hConnect); wsc->hConnect = NULL; }
-    if (wsc->hSession) { WinHttpCloseHandle(wsc->hSession); wsc->hSession = NULL; }
-    return 0;
-}
-
-static int ws_send_text(WSConn *wsc, const char *text) {
-    size_t len = strlen(text);
-    DWORD err = WinHttpWebSocketSend(wsc->hWebSocket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
-                          (void *)text, (DWORD)len);
-    return (err == ERROR_SUCCESS) ? 0 : -1;
-}
-
-static int ws_send_bytes(WSConn *wsc, const uint8_t *data, size_t dlen) {
-    DWORD err = WinHttpWebSocketSend(wsc->hWebSocket, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
-                          (void *)data, (DWORD)dlen);
-    return (err == ERROR_SUCCESS) ? 0 : -1;
-}
-
-static int ws_recv(WSConn *wsc, uint8_t *out, size_t outsz, int *is_text) {
-    DWORD bytesRead = 0;
-    WINHTTP_WEB_SOCKET_BUFFER_TYPE bufType = WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE;
-    DWORD err = WinHttpWebSocketReceive(wsc->hWebSocket, out, (DWORD)outsz, &bytesRead, &bufType);
-    if (err != ERROR_SUCCESS) return -1;
-    if (bufType == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) return -1;
-    *is_text = (bufType == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE ||
-                bufType == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE);
-    return (int)bytesRead;
-}
-
-/*
- * Read one complete WebSocket message, reassembling continuation fragments.
- * Up to outsz bytes are copied into out; any overflow is drained/discarded.
- * Returns:  0 = full message read (total set; pover=1 if truncated)
- *          -1 = connection closed / error
- *          -2 = receive timeout (partial data may be present if total>0)
- */
-static int ws_read_frame(WSConn *wsc, uint8_t *out, size_t outsz,
-                         size_t *ptotal, int *pis_text, int *pover) {
-    size_t total = 0;
-    int is_text = 0, over = 0;
-    uint8_t junk[512];
-    for (;;) {
-        DWORD br = 0;
-        WINHTTP_WEB_SOCKET_BUFFER_TYPE bt = WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE;
-        uint8_t *dst;
-        DWORD cap;
-        if (total < outsz) { dst = out + total; cap = (DWORD)(outsz - total); }
-        else { dst = junk; cap = (DWORD)sizeof(junk); over = 1; }
-        DWORD err = WinHttpWebSocketReceive(wsc->hWebSocket, dst, cap, &br, &bt);
-        if (err == ERROR_WINHTTP_TIMEOUT) {
-            if (ptotal) *ptotal = total;
-            if (pis_text) *pis_text = is_text;
-            if (pover) *pover = over;
-            return total > 0 ? 0 : -2;
-        }
-        if (err != ERROR_SUCCESS) return -1;
-        if (bt == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) return -1;
-        if (bt == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE ||
-            bt == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE) is_text = 1;
-        total += br;
-        if (bt == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE ||
-            bt == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE) {
-            if (ptotal) *ptotal = total;
-            if (pis_text) *pis_text = is_text;
-            if (pover) *pover = over;
-            return 0;
-        }
-    }
-}
-
-static void ws_close(WSConn *wsc) {
-    if (wsc->hWebSocket) {
-        WinHttpWebSocketClose(wsc->hWebSocket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
-        WinHttpCloseHandle(wsc->hWebSocket);
-    }
-    if (wsc->hRequest) WinHttpCloseHandle(wsc->hRequest);
-    if (wsc->hConnect) WinHttpCloseHandle(wsc->hConnect);
-    if (wsc->hSession) WinHttpCloseHandle(wsc->hSession);
-}
-
-static int ws_send_ping(WSConn *wsc) {
-    static const uint8_t ping_payload[4] = { 'A','L','I','V' };
-    DWORD err = WinHttpWebSocketSend(wsc->hWebSocket,
-                                     WINHTTP_WEB_SOCKET_PING_BUFFER_TYPE,
-                                     (void *)ping_payload, sizeof(ping_payload));
-    return (err == ERROR_SUCCESS) ? 0 : -1;
-}
-
-static size_t build_mouse_move_msg(uint8_t *out, size_t osz) {
-    if (osz < 15) return 0;
-    int mx = 100 + (rand() % 200);
-    int my = 100 + (rand() % 200);
-    uint16_t msg_type = 201;
-    uint32_t total_len = 6 + 9;
-    out[0]  = (uint8_t)(msg_type & 0xFF);
-    out[1]  = (uint8_t)((msg_type >> 8) & 0xFF);
-    out[2]  = (uint8_t)(total_len & 0xFF);
-    out[3]  = (uint8_t)((total_len >> 8) & 0xFF);
-    out[4]  = (uint8_t)((total_len >> 16) & 0xFF);
-    out[5]  = (uint8_t)((total_len >> 24) & 0xFF);
-    out[6]  = (uint8_t)(mx & 0xFF);
-    out[7]  = (uint8_t)((mx >> 8) & 0xFF);
-    out[8]  = (uint8_t)((mx >> 16) & 0xFF);
-    out[9]  = (uint8_t)((mx >> 24) & 0xFF);
-    out[10] = (uint8_t)(my & 0xFF);
-    out[11] = (uint8_t)((my >> 8) & 0xFF);
-    out[12] = (uint8_t)((my >> 16) & 0xFF);
-    out[13] = (uint8_t)((my >> 24) & 0xFF);
-    out[14] = 0;
-    return 15;
-}
-
-static size_t build_send_info_msg(uint16_t type_val, const uint8_t *data, size_t dlen, int is_build_msg, uint8_t *out) {
-    size_t msg_length = is_build_msg ? 8 : 0;
-    size_t sz = msg_length + dlen;
-    out[0] = (uint8_t)(type_val & 0xFF);
-    out[1] = (uint8_t)((type_val >> 8) & 0xFF);
-    out[2] = (uint8_t)(sz & 0xFF);
-    out[3] = (uint8_t)((sz >> 8) & 0xFF);
-    out[4] = (uint8_t)((sz >> 16) & 0xFF);
-    out[5] = (uint8_t)((sz >> 24) & 0xFF);
-    if (is_build_msg) {
-        out[6] = (uint8_t)(dlen & 0xFF);
-        out[7] = (uint8_t)((dlen >> 8) & 0xFF);
-        out[8] = (uint8_t)((dlen >> 16) & 0xFF);
-        out[9] = (uint8_t)((dlen >> 24) & 0xFF);
-        out[10] = 8 & 0xFF;
-        out[11] = (8 >> 8) & 0xFF;
-        out[12] = (8 >> 16) & 0xFF;
-        out[13] = (8 >> 24) & 0xFF;
-    }
-    if (dlen > 0) memcpy(out + 6 + msg_length, data, dlen);
-    return 6 + msg_length + dlen;
-}
-
-static size_t build_user_payload(const Session *s, uint8_t *out, size_t out_sz) {
-    char user_json[512];
-    snprintf(user_json, sizeof(user_json),
-             "{\"type\":1,\"userName\":\"%s\",\"userInfo\":\"\",\"userId\":%d}",
-             s->user_account, s->user_id);
-    size_t jlen = strlen(user_json);
-    size_t need = 6 + 8 + jlen;
-    if (need > out_sz) return 0;
-    return build_send_info_msg(118, (const uint8_t *)user_json, jlen, 1, out);
-}
-
 /* ===================== multi-channel clink support ===================== */
 
 typedef struct {
@@ -2395,102 +787,6 @@ static int ws_keepalive(Session *s, Desktop *d, int session_seconds) {
     }
     return 0;
 }
-
-static void mac_to_fingerprint(const char *mac, char *fp_hex) {
-    uint8_t d[32];
-    sha256((const uint8_t *)mac, strlen(mac), d);
-    for (int i = 0; i < 32; i++) {
-        fp_hex[i * 2]     = HEX_LUT[d[i] >> 4];
-        fp_hex[i * 2 + 1] = HEX_LUT[d[i] & 0x0f];
-    }
-    fp_hex[64] = 0;
-}
-
-static void get_fingerprint(char *fp_hex) {
-    char mac[32] = "";
-    DWORD sz = 0;
-    if (GetAdaptersInfo(NULL, &sz) != ERROR_BUFFER_OVERFLOW) {
-        mac_to_fingerprint("", fp_hex);
-        log_line("MAC地址: (空) -> 指纹: %s", fp_hex);
-        return;
-    }
-    BYTE *buf = (BYTE *)malloc(sz);
-    if (!buf) { mac_to_fingerprint("", fp_hex); log_line("MAC地址: (内存不足) -> 指纹: %s", fp_hex); return; }
-    PIP_ADAPTER_INFO pinfo = (PIP_ADAPTER_INFO)buf;
-    if (GetAdaptersInfo(pinfo, &sz) != ERROR_SUCCESS) {
-        free(buf); mac_to_fingerprint("", fp_hex); log_line("MAC地址: (获取失败) -> 指纹: %s", fp_hex); return;
-    }
-    PIP_ADAPTER_INFO adapter = pinfo;
-    while (adapter) {
-        if (adapter->AddressLength == 6) {
-            int nonzero = 0;
-            for (int i = 0; i < 6; i++) {
-                if (adapter->Address[i] != 0) { nonzero = 1; break; }
-            }
-            if (nonzero) {
-                snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
-                         adapter->Address[0], adapter->Address[1], adapter->Address[2],
-                         adapter->Address[3], adapter->Address[4], adapter->Address[5]);
-                break;
-            }
-        }
-        adapter = adapter->Next;
-    }
-    if (!mac[0] && pinfo->AddressLength == 6) {
-        snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
-                 pinfo->Address[0], pinfo->Address[1], pinfo->Address[2],
-                 pinfo->Address[3], pinfo->Address[4], pinfo->Address[5]);
-    }
-    free(buf);
-    mac_to_fingerprint(mac, fp_hex);
-    log_line("MAC地址: %s -> 指纹: %s", mac, fp_hex);
-}
-
-static int get_all_macs(char macs[][32], int max_macs) {
-    int count = 0;
-    DWORD sz = 0;
-    if (GetAdaptersInfo(NULL, &sz) != ERROR_BUFFER_OVERFLOW) return 0;
-    BYTE *buf = (BYTE *)malloc(sz);
-    if (!buf) return 0;
-    PIP_ADAPTER_INFO pinfo = (PIP_ADAPTER_INFO)buf;
-    if (GetAdaptersInfo(pinfo, &sz) != ERROR_SUCCESS) { free(buf); return 0; }
-    PIP_ADAPTER_INFO adapter = pinfo;
-    while (adapter && count < max_macs) {
-        if (adapter->AddressLength == 6) {
-            int nonzero = 0;
-            for (int i = 0; i < 6; i++) {
-                if (adapter->Address[i] != 0) { nonzero = 1; break; }
-            }
-            if (nonzero) {
-                char m[32];
-                snprintf(m, sizeof(m), "%02x:%02x:%02x:%02x:%02x:%02x",
-                         adapter->Address[0], adapter->Address[1], adapter->Address[2],
-                         adapter->Address[3], adapter->Address[4], adapter->Address[5]);
-                int dup = 0;
-                for (int j = 0; j < count; j++) {
-                    if (strcmp(macs[j], m) == 0) { dup = 1; break; }
-                }
-                if (!dup) {
-                    strncpy(macs[count], m, 31);
-                    macs[count][31] = '\0';
-                    count++;
-                }
-            }
-        }
-        adapter = adapter->Next;
-    }
-    free(buf);
-    return count;
-}
-
-static void generate_device_code(const char *fp_hex, char *out, size_t out_sz) {
-    uint8_t h[32];
-    sha256((const uint8_t *)fp_hex, strlen(fp_hex), h);
-    snprintf(out, out_sz, "web_%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
-             h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
-             h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]);
-}
-
 static int read_plain_config(char *user, size_t user_sz, char *pass, size_t pass_sz) {
     char exe_path[MAX_PATH];
     GetModuleFileNameA(NULL, exe_path, MAX_PATH);
@@ -2529,7 +825,6 @@ static int read_plain_config(char *user, size_t user_sz, char *pass, size_t pass
     }
     return 0;
 }
-
 static BOOL WINAPI ctrl_handler(DWORD type) {
     if (type == CTRL_C_EVENT || type == CTRL_CLOSE_EVENT) {
         InterlockedExchange(&g_running, 0);
@@ -2538,7 +833,6 @@ static BOOL WINAPI ctrl_handler(DWORD type) {
     return FALSE;
 }
 
-/* 分段打印超长字符串(积分任务列表 JSON 可能很长) */
 static void log_long(const char *prefix, const char *s) {
     size_t len = strlen(s);
     size_t off = 0;
@@ -2583,7 +877,6 @@ static int fetch_task_1003(const Session *s, long *progress, long *status) {
     return ok;
 }
 
-/* 仅用于测试验证: 查询积分任务列表(不做任何兑换)。 */
 static void query_task_list(const Session *s) {
     char *resp = (char *)malloc(MAX_RESP);
     if (!resp) return;
@@ -2632,6 +925,7 @@ static void dump_connect_data(Session *s) {
     else log_line("[dump] pageDesktop 失败 r=%d", r);
 
     Desktop dts[10];
+    memset(dts, 0, sizeof(dts));
     int cnt = get_desktop_list(s, dts, 10);
     const char *id = NULL;
     if (cnt > 0) {
@@ -2669,7 +963,6 @@ static void dump_connect_data(Session *s) {
     free(resp);
     log_line("[dump] 完成 -> dump.txt");
 }
-
 /*
  * hang_for_points - 挂机主循环
  *
@@ -2715,6 +1008,7 @@ static int hang_for_points(Session *s, const char *user, const char *pwd) {
         log_line("===== 挂机第 %d 轮，累计 %d 秒，剩余 %d 秒 =====", attempt, elapsed, remaining);
 
         Desktop desktops[10];
+        memset(desktops, 0, sizeof(desktops));
         int count = get_desktop_list(s, desktops, 10);
         if (count == 0) {
             consec_fail++;
@@ -2748,7 +1042,7 @@ static int hang_for_points(Session *s, const char *user, const char *pwd) {
             }
             int wait_sec = (consec_fail >= 12) ? 60 : 10;
             log_line("连接桌面失败，%d秒后重试(连续失败%d)", wait_sec, consec_fail);
-            for (int i = 0; i < count; i++) desktop_free(&desktops[i]);
+            for (int i = 0; i < count; i++) desktop_cleanup(&desktops[i]);
             Sleep(wait_sec * 1000);
             continue;
         }
@@ -2756,9 +1050,9 @@ static int hang_for_points(Session *s, const char *user, const char *pwd) {
 
         int rc = ws_keepalive(s, d, remaining);
 
-        desktop_free(d);
+        desktop_cleanup(d);
         for (int i = 0; i < count; i++) {
-            if (i != target) desktop_free(&desktops[i]);
+            if (i != target) desktop_cleanup(&desktops[i]);
         }
 
         if (g_task_complete || rc == 2) {
@@ -2792,6 +1086,1530 @@ static int hang_for_points(Session *s, const char *user, const char *pwd) {
     return 0;
 }
 
+/* ======================== 公共层钩子实现 ======================== */
+
+static int points_console_input(char *out, size_t out_sz) {
+    printf("请输入验证码："); fflush(stdout);
+    if (!fgets(out, (int)out_sz, stdin)) return 0;
+    out[strcspn(out, "\r\n")] = 0;
+    return out[0] ? 1 : 0;
+}
+
+int ct_manual_captcha_mode(void) {
+    const char *v = getenv("CTYUN_MANUAL_CAPTCHA");
+    return (v && v[0] == '1') ? 1 : 0;
+}
+
+int ct_manual_captcha(const uint8_t *img_data, int img_len, char *out, size_t out_sz) {
+    printf("验证码图片已获取，请查看后输入验证码\n");
+    if (img_data && img_len > 0) {
+        char tmp_path[MAX_PATH];
+        GetTempPathA(MAX_PATH, tmp_path);
+        char img_path[MAX_PATH];
+        snprintf(img_path, sizeof(img_path), "%sctyun_captcha.png", tmp_path);
+        FILE *f = fopen(img_path, "wb");
+        if (f) {
+            fwrite(img_data, 1, (size_t)img_len, f);
+            fclose(f);
+            ShellExecuteA(NULL, "open", img_path, NULL, NULL, SW_SHOW);
+            ct_log("验证码已保存到: %s 并已打开", img_path);
+        }
+    }
+    return points_console_input(out, out_sz);
+}
+
+const wchar_t *ct_ws_ua(void) {
+    return L"CtYunPoints/" APP_VERSION;
+}
+
+void ct_log(const char *fmt, ...) {
+    char b[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b, sizeof(b), fmt, ap);
+    va_end(ap);
+    log_line("%s", b);
+}
+
+/* ======================== eaichat AES 支持 ======================== */
+
+static BCRYPT_ALG_HANDLE g_aes_alg = NULL;
+
+/* eaichat 会话密钥解密用 AES-128-ECB；须在公共 crypto_init() 成功后调用 */
+static int chat_aes_init(void) {
+    NTSTATUS st = BCryptOpenAlgorithmProvider(&g_aes_alg, BCRYPT_AES_ALGORITHM, NULL, 0);
+    if (!BCRYPT_SUCCESS(st)) { g_aes_alg = NULL; return 0; }
+    BCryptSetProperty(g_aes_alg, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_ECB,
+                      sizeof(BCRYPT_CHAIN_MODE_ECB), 0);
+    return 1;
+}
+
+/**
+ * ChatSession - eaichat AI对话会话(定义前置，供全局变量使用)
+ *
+ * 与 desk.ctyun.cn:8810 的认证体系完全独立，cookie + 签名(sk)。
+ */
+typedef struct {
+    char cookies[2048];       /* "YL-Token=...; YL-Ssid=..." 形式 */
+    char sk[33];              /* 签名密钥(32 hex + \0) */
+    char session_key[512];    /* ticketAuthorize 返回的 sessionKey(base64) */
+    char client_key[32];      /* 本地AES密钥/RSA明文(16字节字符串) */
+    char xuid[80];            /* x-eai-xuid 值(登录后生成/复用) */
+    int  tenant_id;           /* 租户ID(eaichat用，默认15) */
+    int  logged_in;           /* 是否已登录eaichat */
+    char last_sent_date[12];  /* "YYYY-MM-DD"，当天已发过消息的标记 */
+} ChatSession;
+static ChatSession g_chat = {0};
+
+/**
+ * load_chat_credentials_from_config - 从config.json解密出账号和密码的SHA256，供eaichat复用
+ *
+ * 避免用户为对话功能重复输入账号密码：保活成功后凭据已加密存config.json，
+ * 这里重新解密一遍，算出账号明文 + SHA256(密码) 写入 out_user/out_pass_sha。
+ * 注意: 只输出密码哈希，明文密码立即清零，不长期驻留内存。
+ *
+ * @param out_user      输出账号(明文)缓冲区
+ * @param out_pass_sha  输出密码SHA256(64hex+\0)缓冲区
+ * @param usz           账号缓冲区大小
+ * @return              1=成功, 0=失败(无config或解密失败)
+ */
+static int load_chat_credentials_from_config(char *out_user, char *out_pass_sha, size_t usz) {
+    out_user[0] = 0; out_pass_sha[0] = 0;
+    char exe_path[MAX_PATH];
+    GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+    char *slash = strrchr(exe_path, '\\');
+    if (slash) *slash = 0;
+    char config_path[MAX_PATH];
+    snprintf(config_path, sizeof(config_path), "%s\\config.json", exe_path);
+
+    FILE *f = fopen(config_path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    if (fsize <= 0) { fclose(f); return 0; }
+    fseek(f, 0, SEEK_SET);
+    char *content = (char *)malloc(fsize + 1);
+    if (!content) { fclose(f); return 0; }
+    size_t clen = fread(content, 1, fsize, f);
+    content[clen] = 0;
+    fclose(f);
+
+    char fp[65];
+    get_fingerprint(fp);
+
+    int got = 0;
+    char plain_user[256];   /* 解出的明文账号 */
+    char plain_pass[256];   /* 解出的明文密码(临时，算完SHA立即清零) */
+    plain_user[0] = plain_pass[0] = 0;
+
+    /* 先试v2.0 DPAPI */
+    const char *dpapi_start = strstr(content, "\"dpapi\"");
+    if (dpapi_start) {
+        dpapi_start += strlen("\"dpapi\"");
+        while (*dpapi_start == ' ' || *dpapi_start == ':') dpapi_start++;
+        if (*dpapi_start == '"') {
+            dpapi_start++;
+            const char *dpapi_end = strchr(dpapi_start, '"');
+            if (dpapi_end) {
+                size_t dpapi_len = (size_t)(dpapi_end - dpapi_start);
+                uint8_t *dpapi_ct = (uint8_t *)malloc(dpapi_len);
+                if (dpapi_ct) {
+                    size_t dpapi_ct_len = b64dec(dpapi_start, dpapi_len, dpapi_ct);
+                    if (dpapi_ct_len > 0) {
+                        uint8_t *inner_data = NULL; DWORD inner_len = 0;
+                        if (unprotect_data_dpapi(dpapi_ct, (DWORD)dpapi_ct_len, fp, &inner_data, &inner_len)) {
+                            char *inner_json = (char *)malloc(inner_len + 1);
+                            if (inner_json) {
+                                memcpy(inner_json, inner_data, inner_len);
+                                inner_json[inner_len] = 0;
+                                LocalFree(inner_data);
+                                char salt[65];
+                                jstr(inner_json, "salt", salt, sizeof(salt));
+                                if (salt[0]) {
+                                    uint8_t key[32];
+                                    derive_key(fp, salt, key);
+                                    /* 解析 accounts */
+                                    const char *acc = strstr(inner_json, "\"accounts\"");
+                                    if (acc) {
+                                        acc = strchr(acc, '[');
+                                        if (acc) acc = strchr(acc, '{');
+                                        if (acc) {
+                                            char ua[2048], pw[2048];
+                                            jstr(acc, "user_account", ua, sizeof(ua));
+                                            jstr(acc, "password", pw, sizeof(pw));
+                                            if (decrypt_data(ua, key, plain_user, sizeof(plain_user)) &&
+                                                decrypt_data(pw, key, plain_pass, sizeof(plain_pass))) {
+                                                got = 1;
+                                            }
+                                        }
+                                    }
+                                    SecureZeroMemory(key, sizeof(key));
+                                }
+                                SecureZeroMemory(inner_json, inner_len);
+                                free(inner_json);
+                            }
+                        }
+                    }
+                    free(dpapi_ct);
+                }
+            }
+        }
+    }
+    /* v1.x legacy ChaCha20 回退 */
+    if (!got) {
+        char salt[65];
+        jstr(content, "salt", salt, sizeof(salt));
+        if (salt[0]) {
+            uint8_t key[32];
+            derive_key_legacy(fp, salt, key);
+            const char *acc = strstr(content, "\"accounts\"");
+            if (acc) {
+                acc = strchr(acc, '[');
+                if (acc) acc = strchr(acc, '{');
+                if (acc) {
+                    char ua[2048], pw[2048];
+                    jstr(acc, "user_account", ua, sizeof(ua));
+                    jstr(acc, "password", pw, sizeof(pw));
+                    if (decrypt_data(ua, key, plain_user, sizeof(plain_user)) &&
+                        decrypt_data(pw, key, plain_pass, sizeof(plain_pass))) {
+                        got = 1;
+                    }
+                }
+            }
+            SecureZeroMemory(key, sizeof(key));
+        }
+    }
+    free(content);
+
+    if (got) {
+        strncpy(out_user, plain_user, usz - 1);
+        out_user[usz - 1] = 0;
+        sha256_hex(plain_pass, out_pass_sha);   /* 算SHA256，明文随后清零 */
+        SecureZeroMemory(plain_user, sizeof(plain_user));
+        SecureZeroMemory(plain_pass, sizeof(plain_pass));
+        return 1;
+    }
+    return 0;
+}
+/* ======================== eaichat AI对话 (加密/签名) ======================== */
+/*
+ * eaichat.ctyun.cn 的认证与签名体系，与 desk.ctyun.cn:8810 完全独立。
+ * 已通过抓包逆向 + 本地数学验证全部确认:
+ *
+ *   1. 密码:           SHA256(明文) 无加盐
+ *   2. clientKey:      16字节本地随机串(自生成固定复用)，作为AES密钥和RSA明文
+ *   3. sessionKey:     ticketAuthorize 响应 data.sessionKey (base64)
+ *   4. sk:             AES-128-ECB-Decrypt(base64decode(sessionKey), clientKey)
+ *                      去PKCS7 padding，得到32字符hex(签名用)
+ *   5. 签名 sign:      SHA256( paramsStr [& bodyMd5] + "&" + sk + "&"
+ *                                  + timestamp + "&" + random )
+ *                      paramsStr = URL query参数按键名字典序排序拼 "k=v&k=v"
+ *                      bodyMd5   = MD5(请求体)，GET请求为空
+ *   6. RSA加密clientKey: RSA-1024 PKCS1v1.5 + bytesToHex
+ *                      (用于ticketAuthorize请求的clientKey参数)
+ */
+
+#define CHAT_CLIENT_KEY_LEN   16      /* clientKey固定16字节(AES-128密钥) */
+
+/**
+ * aes128_ecb_decrypt - AES-128-ECB解密(单块或多块)
+ *
+ * 使用CNG解密数据。ECB模式无IV，每16字节独立解密。
+ * 用于eaichat会话密钥: sk = AES-ECB-Decrypt(base64(sessionKey), clientKey)
+ *
+ * @param ct       密文(长度必须是16的倍数)
+ * @param ctlen    密文长度
+ * @param key      16字节AES密钥(clientKey)
+ * @param pt       输出明文缓冲区(至少ctlen字节)
+ * @param ptlen    输出: 明文长度(未去padding)
+ * @return         1=成功, 0=失败
+ */
+static int aes128_ecb_decrypt(const uint8_t *ct, size_t ctlen,
+                               const uint8_t key[16], uint8_t *pt, size_t *ptlen) {
+    if (!g_aes_alg || ctlen == 0 || ctlen % 16 != 0) return 0;
+    BCRYPT_KEY_HANDLE hKey = NULL;
+    NTSTATUS status = BCryptGenerateSymmetricKey(g_aes_alg, &hKey, NULL, 0,
+                                                  (PUCHAR)key, 16, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        return 0;
+    }
+
+    /* ECB模式无IV，传NULL。不用BCRYPT_BLOCK_PADDING(让调用方自行处理PKCS7)，
+     * 因为CNG的ECB+PADDING组合在部分版本上有问题。 */
+    DWORD outlen = (DWORD)ctlen;
+    status = BCryptDecrypt(hKey, (PUCHAR)ct, (ULONG)ctlen, NULL,
+                           NULL, 0, pt, outlen, &outlen,
+                           0);  /* dwFlags=0, 不padding */
+    BCryptDestroyKey(hKey);
+    if (!BCRYPT_SUCCESS(status)) {
+        return 0;
+    }
+    *ptlen = outlen;
+    return 1;
+}
+
+/**
+ * rsa_pkcs1_encrypt_hex - RSA-PKCS1v1.5加密并输出hex字符串
+ *
+ * 用于eaichat ticketAuthorize: clientKey参数 = RSA(clientKey短串, 公钥)转hex。
+ * 公钥为SubjectPublicKeyInfo(DER)格式，直接用BCryptImportKeyPair导入。
+ *
+ * @param pub_der   公钥DER字节(X.509 SubjectPublicKeyInfo)
+ * @param der_len   公钥长度
+ * @param plaintext 明文(通常为clientKey 16字节)
+ * @param plen      明文长度
+ * @param hex_out   输出hex字符串缓冲区
+ * @param hex_sz    输出缓冲区大小(至少 2*der_len 字节)
+ * @return          hex字符串长度, 失败返回0
+ */
+static size_t rsa_pkcs1_encrypt_hex(const uint8_t *pub_der, size_t der_len,
+                                     const uint8_t *plaintext, size_t plen,
+                                     char *hex_out, size_t hex_sz) {
+    /* 把 X.509 SubjectPublicKeyInfo DER 解析为 CERT_PUBLIC_KEY_INFO,
+     * 再用 CryptImportPublicKeyInfoEx2 导入为 CNG 密钥句柄(CryptoAPI/CNG互通)。 */
+    CERT_PUBLIC_KEY_INFO *pki = NULL;
+    DWORD pki_len = 0;
+    if (!CryptDecodeObjectEx(X509_ASN_ENCODING, X509_PUBLIC_KEY_INFO,
+                             pub_der, der_len,
+                             CRYPT_DECODE_ALLOC_FLAG, NULL,
+                             &pki, &pki_len)) {
+        return 0;
+    }
+    BCRYPT_KEY_HANDLE hKey = NULL;
+    BOOLEAN ok = CryptImportPublicKeyInfoEx2(X509_ASN_ENCODING, pki, 0, NULL, &hKey);
+    LocalFree(pki);
+    if (!ok || !hKey) return 0;
+
+    /* RSA PKCS1v1.5 加密(CNG默认OAEP需指定padding) */
+    BCRYPT_PKCS1_PADDING_INFO pad = {0};
+    pad.pszAlgId = BCRYPT_SHA1_ALGORITHM;  /* PKCS1v1.5不需要hashAlg，但结构体要填 */
+    /* 实际PKCS1v1.5(v1.5)不使用OAEP的hash，用 BCRYPT_PAD_PKCS1 */
+    uint8_t *buf = (uint8_t *)malloc(plen + 512);
+    if (!buf) { BCryptDestroyKey(hKey); return 0; }
+    ULONG blen = 0;
+    NTSTATUS status = BCryptEncrypt(hKey, (PUCHAR)plaintext, (ULONG)plen,
+                                    &pad, NULL, 0,
+                                    buf, (ULONG)(plen + 512), &blen,
+                                    BCRYPT_PAD_PKCS1);
+    BCryptDestroyKey(hKey);
+    if (!BCRYPT_SUCCESS(status)) {
+        free(buf);
+        return 0;
+    }
+    size_t hexlen = 0;
+    for (ULONG i = 0; i < blen && hexlen + 2 < hex_sz; i++) {
+        hex_out[hexlen++] = HEX_LUT[buf[i] >> 4];
+        hex_out[hexlen++] = HEX_LUT[buf[i] & 0x0F];
+    }
+    hex_out[hexlen] = 0;
+    free(buf);
+    return hexlen;
+}
+
+/**
+ * md5_hex_of_bytes - 计算二进制数据的MD5并输出32字符hex
+ *
+ * 区别于md5_hex(行486,只处理字符串),本函数处理任意二进制+指定长度,
+ * 用于eaichat签名的 bodyMd5 = MD5(请求体)。
+ */
+static void md5_hex_of_bytes(const uint8_t *d, size_t n, char *out) {
+    HCRYPTHASH h;
+    if (!CryptCreateHash(g_crypt, CALG_MD5, 0, 0, &h)) { out[0] = 0; return; }
+    if (!CryptHashData(h, (BYTE *)d, (DWORD)n, 0)) { CryptDestroyHash(h); out[0] = 0; return; }
+    uint8_t digest[16];
+    DWORD dl = 16;
+    if (!CryptGetHashParam(h, HP_HASHVAL, digest, &dl, 0)) { CryptDestroyHash(h); out[0] = 0; return; }
+    CryptDestroyHash(h);
+    for (int i = 0; i < 16; i++) {
+        out[i * 2] = HEX_LUT[digest[i] >> 4];
+        out[i * 2 + 1] = HEX_LUT[digest[i] & 0x0F];
+    }
+    out[32] = 0;
+}
+
+/**
+ * sha256_hex_of_bytes - 计算二进制数据的SHA256并输出64字符hex
+ *
+ * 用于eaichat签名: sign = SHA256(origin串)。
+ */
+static void sha256_hex_of_bytes(const uint8_t *d, size_t n, char *out) {
+    uint8_t digest[32];
+    sha256(d, n, digest);
+    for (int i = 0; i < 32; i++) {
+        out[i * 2] = HEX_LUT[digest[i] >> 4];
+        out[i * 2 + 1] = HEX_LUT[digest[i] & 0x0F];
+    }
+    out[64] = 0;
+}
+
+/**
+ * eai_sign - 生成eaichat请求签名
+ *
+ * 算法(已验证):
+ *   prefix  = paramsStr ? paramsStr : ""
+ *   bodyMd5 = body非空 ? MD5(body) : ""
+ *   if (prefix && bodyMd5) origin = prefix + "&" + bodyMd5
+ *   else                   origin = prefix ? prefix : bodyMd5
+ *   final_origin = origin + "&" + sk + "&" + timestamp + "&" + random
+ *   sign = SHA256(final_origin)
+ *
+ * 注意: 实际JS逻辑是 l = paramsStr; if(bodyMd5) l = l ? l+"&"+bodyMd5 : bodyMd5;
+ *       然后 c = (l?l+"&":"") + sk + "&" + ts + "&" + random
+ *       即: 若l非空, origin=l+"&"+sk+...; 若l空, origin=sk+...
+ *
+ * @param params_str  URL query参数串(已排序,如"k1=v1&k2=v2")，可为""
+ * @param body        请求体(POST)，可为NULL
+ * @param body_len    请求体长度
+ * @param sk          签名密钥(32 hex字符)
+ * @param sign_out    输出sign(64 hex + \0, 至少65字节)
+ * @param random_out  输出random(8字符 + \0, 至少9字节)
+ * @param ts_out      输出timestamp字符串(至少16字节)
+ */
+static void eai_sign(const char *params_str, const uint8_t *body, size_t body_len,
+                     const char *sk, char *sign_out, char *random_out, char *ts_out) {
+    /* bodyMd5 */
+    char body_md5[33] = "";
+    if (body && body_len > 0) {
+        md5_hex_of_bytes(body, body_len, body_md5);
+    }
+
+    /* 构造 l = prefix (paramsStr + 可选 bodyMd5) */
+    /* JS: l = n(paramsStr); if(bodyMd5) l = l ? l+"&"+bodyMd5 : bodyMd5; */
+    char l_buf[2048];
+    size_t lp = 0;
+    if (params_str && params_str[0]) {
+        size_t sl = strlen(params_str);
+        if (sl > sizeof(l_buf) - 1) sl = sizeof(l_buf) - 1;
+        memcpy(l_buf, params_str, sl);
+        lp = sl;
+        l_buf[lp] = 0;
+    }
+    if (body_md5[0]) {
+        if (lp > 0) {
+            l_buf[lp++] = '&';
+        }
+        if (lp + 32 < sizeof(l_buf)) {
+            memcpy(l_buf + lp, body_md5, 32);
+            lp += 32;
+            l_buf[lp] = 0;
+        }
+    }
+
+    /* timestamp (毫秒) + random(8字符) */
+    long long ts = (long long)time(NULL) * 1000LL;
+    snprintf(ts_out, 16, "%lld", ts);
+    /* 8字符随机串: 字母+数字 */
+    {
+        static const char *RND_CHARS =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        uint8_t rnd[8];
+        if (CryptGenRandom(g_crypt, 8, rnd)) {
+            for (int i = 0; i < 8; i++) {
+                random_out[i] = RND_CHARS[rnd[i] % 62];
+            }
+        } else {
+            for (int i = 0; i < 8; i++) random_out[i] = RND_CHARS[i % 62];
+        }
+        random_out[8] = 0;
+    }
+
+    /* final origin: (l ? l+"&" : "") + sk + "&" + ts + "&" + random */
+    char origin[4096];
+    int olen = 0;
+    if (lp > 0) {
+        olen = snprintf(origin, sizeof(origin), "%.*s&%s&%s&%s",
+                        (int)lp, l_buf, sk, ts_out, random_out);
+    } else {
+        olen = snprintf(origin, sizeof(origin), "%s&%s&%s",
+                        sk, ts_out, random_out);
+    }
+    (void)olen;
+    sha256_hex_of_bytes((const uint8_t *)origin, strlen(origin), sign_out);
+}
+
+/* ---- eaichat 登录链路与发消息 ---- */
+
+/* RSA公钥(X.509 SubjectPublicKeyInfo, DER base64)，从ssopk解码得到，固定 */
+static const char *EAI_SSOPK_B64 =
+    "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCHaZ5BNp518C/OEOup76d/HXbg6nUGJWiLzMoy4Qg87izLG1dRJ6PIPawt3vGvLuVMG0x8cwPfUfUrfUO1w6e9luGbJLohWwlqBdB0znnmBi5FHWqnNmvigLDVNfOKjQ0NsHhf+6D/aF2RVx+axWPE6auX2iPsYgN8OCOhhfXZwwIDAQAB";
+static const char *EAI_SSOPK_ID = "Prod-1-20230613";
+static const char *EAI_IAM_LOGIN_URL =
+    "https://desk.ctyun.cn/cloudB/dy/iam/api/auth/iam/login";
+static const char *EAI_TICKET_AUTH_URL =
+    "https://eaichat.ctyun.cn/sso/login/v2/iam/ticketAuthorize";
+static const char *EAI_CHAT_URL =
+    "https://eaichat.ctyun.cn/ai/portal/wenc/v3/openai/chat/completions";
+static const char *EAI_USER_AGENT =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
+
+/**
+ * gen_uuid - 生成UUID字符串(8-4-4-4-12格式)
+ *
+ * eaichat 的 verify_id、x-client-trace-id 都需要UUID。
+ * 用CryptGenRandom生成随机字节后格式化。
+ *
+ * @param out   输出缓冲区(至少37字节)
+ */
+static void gen_uuid(char *out) {
+    uint8_t b[16];
+    if (!CryptGenRandom(g_crypt, 16, b)) {
+        for (int i = 0; i < 16; i++) b[i] = (uint8_t)(rand() & 0xFF);
+    }
+    /* 设置version(4)和variant */
+    b[6] = (b[6] & 0x0F) | 0x40;
+    b[8] = (b[8] & 0x3F) | 0x80;
+    snprintf(out, 37, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
+}
+
+/**
+ * gen_client_key - 生成16字节clientKey(字母数字)
+ *
+ * 替代前端R()。eaichat的clientKey是本地AES密钥/RSA明文，服务端不校验具体值，
+ * 只要ticketAuthorize的RSA密文能用同一clientKey解出sk即可。
+ * 生成一次后持久化复用。
+ *
+ * @param out  输出缓冲区(至少17字节)
+ */
+static void gen_client_key(char *out) {
+    static const char *CK =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    uint8_t rnd[16];
+    if (!CryptGenRandom(g_crypt, 16, rnd)) {
+        for (int i = 0; i < 16; i++) rnd[i] = (uint8_t)(rand() & 0xFF);
+    }
+    for (int i = 0; i < 16; i++) out[i] = CK[rnd[i] % 62];
+    out[16] = 0;
+}
+
+/**
+ * derive_sk_from_session_key - 从sessionKey派生sk
+ *
+ * sk = AES-128-ECB-Decrypt(base64decode(sessionKey), clientKey)
+ *      去PKCS7 padding，得到32字符hex字符串。
+ *
+ * @param session_key  ticketAuthorize返回的base64 sessionKey
+ * @param client_key   16字节AES密钥
+ * @param sk_out       输出sk(至少33字节)
+ * @return             1=成功, 0=失败
+ */
+static int derive_sk_from_session_key(const char *session_key, const char *client_key, char *sk_out) {
+    /* base64解码sessionKey(忽略空格/换行) */
+    size_t b64len = strlen(session_key);
+    uint8_t *ct = (uint8_t *)malloc(b64len + 1);
+    if (!ct) return 0;
+    /* 过滤非base64字符(如sessionKey里的空格) */
+    size_t ct_len = 0;
+    for (size_t i = 0; i < b64len; i++) {
+        char c = session_key[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=') {
+            ct[ct_len++] = (uint8_t)c;
+        }
+    }
+    uint8_t *plain = (uint8_t *)malloc(ct_len + 1);
+    if (!plain) { free(ct); return 0; }
+    size_t pt_len = b64dec((const char *)ct, ct_len, plain);
+    free(ct);
+    if (pt_len == 0 || pt_len % 16 != 0) { free(plain); return 0; }
+
+    size_t out_len = 0;
+    int ok = aes128_ecb_decrypt(plain, pt_len, (const uint8_t *)client_key, plain, &out_len);
+    if (!ok) {
+        free(plain);
+        return 0;
+    }
+    if (out_len >= 33) out_len = 32;
+    memcpy(sk_out, plain, out_len);
+    sk_out[out_len] = 0;
+    SecureZeroMemory(plain, pt_len);
+    free(plain);
+    /* 验证sk是32位hex */
+    if (strlen(sk_out) != 32) return 0;
+    for (const char *p = sk_out; *p; p++) {
+        if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')))
+            return 0;
+    }
+    return 1;
+}
+
+/**
+ * chat_login - 执行eaichat账密登录全链路
+ *
+ * 1. iam/login(账密POST) → 拿iamTicket
+ * 2. ticketAuthorize(iamTicket+RSA加密clientKey) → 拿sessionKey + Set-Cookie(YL-Token/YL-Ssid)
+ * 3. derive_sk → 派生sk
+ *
+ * @param cs     ChatSession(输出 cookies/sk/session_key)
+ * @param user   账号(手机号)
+ * @param pwd    明文密码
+ * @return       1=成功, 0=失败
+ */
+/**
+ * chat_login - 执行eaichat账密登录全链路
+ *
+ * 1. iam/login(账密POST) → 拿iamTicket
+ * 2. ticketAuthorize(iamTicket+RSA加密clientKey) → 拿sessionKey + Set-Cookie(YL-Token/YL-Ssid)
+ * 3. derive_sk → 派生sk
+ *
+ * @param cs        ChatSession(输出 cookies/sk/session_key)
+ * @param user      账号(手机号)
+ * @param pwd_sha   密码的SHA256哈希(64位hex字符串，即 eaichat iam/login 的password字段)
+ *                  注意: 此处直接用哈希，调用方负责算SHA256(明文)，避免明文长期驻留
+ * @return          1=成功, 0=失败
+ */
+static int chat_login(ChatSession *cs, const char *user, const char *pwd_sha) {
+    /* 确保client_key存在 */
+    if (!cs->client_key[0]) {
+        gen_client_key(cs->client_key);
+    }
+
+    /* ---- Step1: iam/login ---- */
+    /* password字段直接用传入的SHA256哈希 */
+    char dc[40];
+    snprintf(dc, sizeof(dc), "iam:%s", cs->client_key);
+
+    char login_body[1024];
+    snprintf(login_body, sizeof(login_body),
+             "{\"userAccount\":\"%s\",\"password\":\"%s\",\"deviceCode\":\"%s\",\"deviceName\":\"iam:web\"}",
+             user, pwd_sha, dc);
+
+    const char *login_hdrs[8] = {
+        "accept: application/json, text/plain, */*",
+        "content-type: application/json",
+        "origin: https://desk.ctyun.cn",
+        "referer: https://desk.ctyun.cn/cloudB/dy/iam/",
+        "if-modified-since: 0"
+    };
+    /* 构造User-Agent头 */
+    char ua_hdr[256];
+    snprintf(ua_hdr, sizeof(ua_hdr), "user-agent: %s", EAI_USER_AGENT);
+    login_hdrs[5] = ua_hdr;
+
+    char login_resp[MAX_RESP];
+    int login_status = 0;
+    int rlen = http_req_with_cookies("POST", EAI_IAM_LOGIN_URL,
+                                      login_body, strlen(login_body),
+                                      NULL, login_hdrs, 6,
+                                      cs->cookies, cs->cookies, sizeof(cs->cookies),
+                                      login_resp, sizeof(login_resp), &login_status);
+    if (rlen < 0) {
+        log_line("[eaichat] iam/login请求失败");
+        return 0;
+    }
+
+    /* 提取iamTicket(可能直接在响应JSON里，或通过Set-Cookie/重定向) */
+    /* 观察抓包: iam/login成功后前端轮询qrCode/status拿ticket，但账密登录
+     * 的iam/login响应应直接返回ticket或登录态。这里尝试从响应提取。 */
+    char iam_ticket[1024] = "";
+    /* ticket可能在 data.ticket / data.iamTicket / 直接重定向Location */
+    jstr(login_resp, "ticket", iam_ticket, sizeof(iam_ticket));
+    if (!iam_ticket[0]) jstr(login_resp, "iamTicket", iam_ticket, sizeof(iam_ticket));
+    /* 某些版本ticket在data对象里 */
+    if (!iam_ticket[0]) {
+        const char *dp = strstr(login_resp, "\"data\"");
+        if (dp) {
+            jstr(dp, "ticket", iam_ticket, sizeof(iam_ticket));
+            if (!iam_ticket[0]) jstr(dp, "iamTicket", iam_ticket, sizeof(iam_ticket));
+        }
+    }
+
+    if (!iam_ticket[0]) {
+        /* iam/login 响应里没有 ticket。
+         * 真实流程: iam/login 成功(设token_iam cookie)后，需再请求
+         * cas/login?service=<eaichat URL>，服务端检测token_iam有效→
+         * 302重定向，Location里带 ?ticket=ST-xxx。
+         * 此处发起 cas/login 并从 Location 提取 ticket。 */
+        log_line("[eaichat] iam/login成功，请求cas/login换ticket...");
+
+        /* 构造 cas/login URL(带service参数) */
+        char cas_url[512];
+        /* 方案2：service 值改用不含 "//" 的形式，绕过 WinHTTP URL 规范化。
+         * 原值 https://eaichat... 中的双斜杠会让 WinHTTP 把 query 截断。
+         * 这里用 https:/eaichat...（单斜杠），服务端若做 URL 规范化应能识别。 */
+        snprintf(cas_url, sizeof(cas_url),
+                 "https://desk.ctyun.cn/cloudB/dy/iam/api/auth/iam/cas/login"
+                 "?service=https:/eaichat.ctyun.cn:443/chat/%%23/aichat");
+
+        const char *cas_hdrs[8] = {
+            "accept: application/json, text/plain, */*",
+            "referer: https://desk.ctyun.cn/cloudB/dy/iam/",
+            "if-modified-since: 0"
+        };
+        char cas_ua[256]; snprintf(cas_ua, sizeof(cas_ua), "user-agent: %s", EAI_USER_AGENT);
+        cas_hdrs[3] = cas_ua;
+
+        char cas_resp[4096];
+        int cas_status = 0;
+        char location[1024] = "";
+        /* 先尝试 WinHTTP 方案 2 */
+        log_line("[eaichat] cas/login 尝试 WinHTTP 方案 2(单斜杠 service)...");
+        int crlen = http_get_with_winhttp(cas_url, cas_hdrs, 4,
+                                           cs->cookies,
+                                           cas_resp, sizeof(cas_resp),
+                                           &cas_status, location, sizeof(location));
+        if (cas_status != 302 || !location[0]) {
+            log_line("[eaichat] WinHTTP 方案 2 失败(status=%d)，回退到 curl.exe", cas_status);
+            /* 回退时仍用原双斜杠 URL，curl.exe 不做 WinHTTP 规范化 */
+            snprintf(cas_url, sizeof(cas_url),
+                     "https://desk.ctyun.cn/cloudB/dy/iam/api/auth/iam/cas/login"
+                     "?service=https%%3A%%2F%%2Feaichat.ctyun.cn%%3A443%%2Fchat%%2F%%23%%2Faichat");
+            crlen = http_get_via_curl(cas_url, cas_hdrs, 4,
+                                       cs->cookies, NULL, 0,
+                                       cas_resp, sizeof(cas_resp), &cas_status, location, sizeof(location));
+        }
+        log_line("[eaichat] cas/login status=%d", cas_status);
+        (void)crlen;
+        if (cas_status != 302 || !location[0]) {
+            log_line("[eaichat] cas/login未返回重定向(status=%d)", cas_status);
+            return 0;
+        }
+        /* 从 location 提取 ticket=ST-xxx */
+        const char *tp = strstr(location, "ticket=");
+        if (!tp) {
+            log_line("[eaichat] cas/login重定向无ticket: %s", location);
+            return 0;
+        }
+        tp += 7;
+        size_t ti = 0;
+        while (*tp && *tp != '&' && *tp != '#' && ti < sizeof(iam_ticket) - 1) {
+            iam_ticket[ti++] = *tp++;
+        }
+        iam_ticket[ti] = 0;
+    }
+
+    if (!iam_ticket[0]) {
+        char msg[256]; jstr(login_resp, "msg", msg, sizeof(msg));
+        log_line("[eaichat] 登录失败，未获取到ticket (code=%d msg=%s)", login_status, msg);
+        return 0;
+    }
+    log_line("[eaichat] 获取ticket成功(%zu字符)", strlen(iam_ticket));
+
+    /* ---- Step3: ticketAuthorize ---- */
+    /* RSA加密clientKey → hex */
+    /* base64解码公钥 */
+    size_t pk_b64len = strlen(EAI_SSOPK_B64);
+    uint8_t *pub_der = (uint8_t *)malloc(pk_b64len + 1);
+    if (!pub_der) return 0;
+    size_t der_len = b64dec(EAI_SSOPK_B64, pk_b64len, pub_der);
+
+    char rsa_hex[1024];
+    size_t rsa_len = rsa_pkcs1_encrypt_hex(pub_der, der_len,
+                                            (const uint8_t *)cs->client_key, 16,
+                                            rsa_hex, sizeof(rsa_hex));
+    free(pub_der);
+    if (rsa_len == 0) {
+        log_line("[eaichat] RSA加密clientKey失败");
+        return 0;
+    }
+
+    /* 构造表单 body (application/x-www-form-urlencoded) */
+    char ta_body[4096];
+    int bl = snprintf(ta_body, sizeof(ta_body),
+        "loginType=iamTicket&clientId=eaiapp&iamTicket=%s"
+        "&redirectUri=https%%3A%%2F%%2Feaichat.ctyun.cn%%3A443%%2Fchat%%2F%%23%%2Faichat"
+        "&clientKey=%s&clientKeyId=%s",
+        iam_ticket, rsa_hex, EAI_SSOPK_ID);
+
+    const char *ta_hdrs[8] = {
+        "accept: application/json, text/plain, */*",
+        "content-type: application/x-www-form-urlencoded;charset=UTF-8",
+        "origin: https://eaichat.ctyun.cn",
+        "referer: https://eaichat.ctyun.cn/chat/"
+    };
+    char ta_ua[256]; snprintf(ta_ua, sizeof(ta_ua), "user-agent: %s", EAI_USER_AGENT);
+    ta_hdrs[4] = ta_ua;
+
+    char ta_resp[MAX_RESP];
+    int ta_status = 0;
+    rlen = http_req_with_cookies("POST", EAI_TICKET_AUTH_URL,
+                                  ta_body, (size_t)bl, NULL, ta_hdrs, 5,
+                                  cs->cookies, cs->cookies, sizeof(cs->cookies),
+                                  ta_resp, sizeof(ta_resp), &ta_status);
+    if (rlen < 0) {
+        log_line("[eaichat] ticketAuthorize请求失败");
+        return 0;
+    }
+
+    /* 提取 sessionKey */
+    char session_key[512] = "";
+    jstr(ta_resp, "sessionKey", session_key, sizeof(session_key));
+    if (!session_key[0]) {
+        log_line("[eaichat] ticketAuthorize响应无sessionKey: %.200s", ta_resp);
+        return 0;
+    }
+    strncpy(cs->session_key, session_key, sizeof(cs->session_key) - 1);
+    cs->session_key[sizeof(cs->session_key) - 1] = 0;
+
+    /* ---- Step3: 派生sk ---- */
+    if (!derive_sk_from_session_key(cs->session_key, cs->client_key, cs->sk)) {
+        log_line("[eaichat] 从sessionKey派生sk失败");
+        return 0;
+    }
+
+    cs->logged_in = 1;
+    cs->tenant_id = 15;
+    log_line("[eaichat] 登录成功，sk=%s", cs->sk);
+    return 1;
+}
+
+/**
+ * chat_collect_reply_callback - SSE回调，收集回复文本
+ *
+ * eaichat SSE 的每个 data: 是一个 JSON，含 delta.content 或完成标志。
+ * 累积 content 到 userdata 指向的缓冲区。
+ */
+typedef struct {
+    char *buf;
+    size_t cap;
+    size_t len;
+    int finished;
+    int got_content;
+} ChatReplyCtx;
+
+static int chat_collect_reply_callback(const char *data, size_t dlen, void *userdata) {
+    ChatReplyCtx *ctx = (ChatReplyCtx *)userdata;
+    if (!data || dlen == 0) return 0;
+    /* "[DONE]" 表示流结束 */
+    if (dlen >= 6 && strncmp(data, "[DONE]", 6) == 0) {
+        ctx->finished = 1;
+        return 1;
+    }
+    /* 解析JSON里的 content 字段(delta增量) */
+    /* data 格式: {"choices":[{"delta":{"content":"xxx"}}],...} 或 {"content":"xxx"} */
+    char field[1024];
+    /* 优先 delta.content */
+    if (jstr_range(data, data + dlen, "content", field, sizeof(field)) && field[0]) {
+        /* 过滤掉非文本的(如 reasoning_content 误匹配) */
+        size_t fl = strlen(field);
+        if (ctx->len + fl < ctx->cap) {
+            memcpy(ctx->buf + ctx->len, field, fl);
+            ctx->len += fl;
+            ctx->buf[ctx->len] = 0;
+            ctx->got_content = 1;
+        }
+    }
+    return 0;
+}
+
+/**
+ * chat_send_message - 向eaichat发送一条消息并等待回复
+ *
+ * @param cs       ChatSession(需已登录)
+ * @param message  消息文本
+ * @param reply    输出回复文本缓冲区
+ * @param reply_sz 回复缓冲区大小
+ * @param conv_id  会话ID(续聊用，新对话传空串)
+ * @return         1=成功收到回复, 0=失败
+ */
+static int chat_send_message(ChatSession *cs, const char *message,
+                              char *reply, size_t reply_sz, const char *conv_id) {
+    if (!cs->logged_in || !cs->sk[0]) return 0;
+
+    /* 生成 verify_id (UUID) */
+    char verify_id[40];
+    gen_uuid(verify_id);
+
+    /* 构造请求体JSON */
+    char body[4096];
+    int bl;
+    if (conv_id && conv_id[0]) {
+        bl = snprintf(body, sizeof(body),
+            "{\"key_model\":\"TEXT_DEEPSEEK_V4\","
+            "\"messages\":[{\"role\":\"user\",\"content\":\"%s\",\"verify_id\":\"%s\","
+            "\"ref\":{\"type\":\"file\",\"file\":[]}}],"
+            "\"stream\":true,\"client_retry\":true,\"web_search\":true,"
+            "\"tenantId\":%d,\"enable_thinking\":false,\"conversation_id\":\"%s\"}",
+            message, verify_id, cs->tenant_id, conv_id);
+    } else {
+        bl = snprintf(body, sizeof(body),
+            "{\"key_model\":\"TEXT_DEEPSEEK_V4\","
+            "\"messages\":[{\"role\":\"user\",\"content\":\"%s\",\"verify_id\":\"%s\","
+            "\"ref\":{\"type\":\"file\",\"file\":[]}}],"
+            "\"stream\":true,\"client_retry\":true,\"web_search\":true,"
+            "\"tenantId\":%d,\"enable_thinking\":false}",
+            message, verify_id, cs->tenant_id);
+    }
+
+    /* 计算签名(POST无params) */
+    char sign[65], random[16], ts[16];
+    eai_sign("", (const uint8_t *)body, (size_t)bl, cs->sk, sign, random, ts);
+
+    /* 生成 x-client-trace-id (UUID) */
+    char trace_id[40];
+    gen_uuid(trace_id);
+
+    /* 构造请求头(全部已知字段) */
+    char hdr_sign[80], hdr_random[32], hdr_ts[40], hdr_trace[80];
+    char hdr_xuid[120];
+    snprintf(hdr_sign, sizeof(hdr_sign), "web-signature: %s", sign);
+    snprintf(hdr_random, sizeof(hdr_random), "web-random: %s", random);
+    snprintf(hdr_ts, sizeof(hdr_ts), "web-timestamp: %s", ts);
+    snprintf(hdr_trace, sizeof(hdr_trace), "x-client-trace-id: %s", trace_id);
+    snprintf(hdr_xuid, sizeof(hdr_xuid), "x-eai-xuid: %s", cs->xuid[0] ? cs->xuid : "pubweb_00000000-0000-0000-0000-000000000000");
+
+    const char *hdrs[24];  /* 实际填17个头，预留余量避免栈溢出 */
+    int nh = 0;
+    hdrs[nh++] = "accept: */*";
+    hdrs[nh++] = "content-type: application/json";
+    hdrs[nh++] = "origin: https://eaichat.ctyun.cn";
+    hdrs[nh++] = "referer: https://eaichat.ctyun.cn/chat/";
+    char hdr_ua[256]; snprintf(hdr_ua, sizeof(hdr_ua), "user-agent: %s", EAI_USER_AGENT);
+    hdrs[nh++] = hdr_ua;
+    hdrs[nh++] = hdr_sign;
+    hdrs[nh++] = hdr_random;
+    hdrs[nh++] = hdr_ts;
+    hdrs[nh++] = hdr_trace;
+    hdrs[nh++] = hdr_xuid;
+    hdrs[nh++] = "x-eai-env: pubWeb";
+    hdrs[nh++] = "x-eai-mode: eai";
+    hdrs[nh++] = "x-eai-source: web-eai";
+    char hdr_tenant[32]; snprintf(hdr_tenant, sizeof(hdr_tenant), "x-eai-tenant-id: %d", cs->tenant_id);
+    hdrs[nh++] = hdr_tenant;
+    hdrs[nh++] = "x-eai-version: 202060201";
+    hdrs[nh++] = "yl-main-version: 202060201";
+    hdrs[nh++] = "yl-product-id: 5";
+
+    /* 读SSE流 */
+    reply[0] = 0;
+    ChatReplyCtx ctx = { reply, reply_sz - 1, 0, 0, 0 };
+    int total = http_read_sse(EAI_CHAT_URL, body, (size_t)bl, hdrs, nh, cs->cookies,
+                               chat_collect_reply_callback, &ctx);
+    if (total < 0) {
+        log_line("[eaichat] 发送消息失败(SSE读取错误)");
+        return 0;
+    }
+    if (!ctx.got_content) {
+        log_line("[eaichat] 未收到AI回复(读取%d字节)", total);
+        return 0;
+    }
+    log_line("[eaichat] 收到回复(%zu字符): %.100s", ctx.len, reply);
+    return 1;
+}
+/* 问题列表文件名(与exe同目录) */
+#define QUESTIONS_FILE "questions.txt"
+/* 生成问题的提示词 */
+#define QUESTIONS_PROMPT "\xe9\x9a\x8f\xe6\x9c\xba\xe8\xbe\x93\xe5\x87\xba" "300\xe4\xb8\xaa\xe5\xb8\xb8\xe8\xaf\x86\xe9\x97\xae\xe9\xa2\x98\xef\xbc\x8c\xe6\xa0\xbc\xe5\xbc\x8f\xe4\xb8\xba\xe6\xaf\x8f\xe8\xa1\x8c\xe4\xb8\x80\xe4\xb8\xaa\xe9\x97\xae\xe9\xa2\x98\xef\xbc\x8c\xe4\xb8\x8d\xe5\x8a\xa0\xe5\xba\x8f\xe5\x8f\xb7\xef\xbc\x8c\xe5\x8f\xaa\xe8\xbe\x93\xe5\x87\xba\xe9\x97\xae\xe9\xa2\x98\xe6\x9c\xac\xe8\xba\xab\xef\xbc\x88\xe5\x90\xab\xe6\xa0\x87\xe7\x82\xb9\xe7\xac\xa6\xe5\x8f\xb7\xef\xbc\x89\xe3\x80\x82"
+
+/**
+ * get_questions_path - 获取 questions.txt 的完整路径
+ */
+static void get_questions_path(char *out, size_t outsz) {
+    char exe_path[MAX_PATH];
+    GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+    char *slash = strrchr(exe_path, '\\');
+    if (slash) *slash = 0;
+    snprintf(out, outsz, "%s\\%s", exe_path, QUESTIONS_FILE);
+}
+
+/**
+ * generate_questions - 向AI请求生成300个常识问题，保存到 questions.txt
+ *
+ * @return 1=成功, 0=失败
+ */
+static int generate_questions(void) {
+    char qpath[MAX_PATH];
+    get_questions_path(qpath, sizeof(qpath));
+
+    log_line("[eaichat] 问题列表不存在，向AI请求生成300个常识问题...");
+
+    char reply[65536];
+    int send_ok = chat_send_message(&g_chat, QUESTIONS_PROMPT, reply, sizeof(reply), "");
+    if (!send_ok) {
+        log_line("[eaichat] 生成问题列表失败(AI未回复)");
+        return 0;
+    }
+
+    /* 将AI回复按行拆分写入 questions.txt */
+    FILE *f = fopen(qpath, "w");
+    if (!f) {
+        log_line("[eaichat] 无法写入 %s", qpath);
+        return 0;
+    }
+
+    int count = 0;
+    const char *p = reply;
+    while (*p) {
+        /* 跳过行首换行 */
+        while (*p == '\r' || *p == '\n') p++;
+        if (!*p) break;
+
+        /* 提取一行 */
+        const char *start = p;
+        while (*p && *p != '\r' && *p != '\n') p++;
+        size_t line_len = (size_t)(p - start);
+
+        /* 去除行尾空白 */
+        while (line_len > 0 && (start[line_len-1] == ' ' || start[line_len-1] == '\t'))
+            line_len--;
+
+        /* 跳过空行 */
+        if (line_len == 0) continue;
+
+        /* 跳过序号前缀(如 "1." "23. " "1、" 等) */
+        const char *wp = start;
+        size_t wlen = line_len;
+        if (wlen >= 2 && wp[0] >= '0' && wp[0] <= '9') {
+            const char *dp = wp;
+            while (dp < wp + wlen && *dp >= '0' && *dp <= '9') dp++;
+            if (dp < wp + wlen && *dp == '.') {
+                dp++;
+                while (dp < wp + wlen && (*dp == ' ' || *dp == '\t')) dp++;
+                wp = dp;
+                wlen = (size_t)(start + line_len - wp);
+            } else if (dp + 2 < wp + wlen && dp[0] == '\xe3' && dp[1] == '\x80' && dp[2] == '\x81') {
+                /* UTF-8 顿号 "、" = \xe3\x80\x81 */
+                dp += 3;
+                while (dp < wp + wlen && (*dp == ' ' || *dp == '\t')) dp++;
+                wp = dp;
+                wlen = (size_t)(start + line_len - wp);
+            }
+        }
+
+        if (wlen == 0) continue;
+        fwrite(wp, 1, wlen, f);
+        fputc('\n', f);
+        count++;
+    }
+    fclose(f);
+    log_line("[eaichat] 问题列表已生成(%d个问题)", count);
+    return count > 0;
+}
+
+/**
+ * pick_question - 从 questions.txt 随机取一个问题，并从文件中删除它
+ *
+ * @param out     输出问题文本
+ * @param outsz   输出缓冲区大小
+ * @return        1=成功取到问题, 0=无问题或读取失败
+ */
+static int pick_question(char *out, size_t outsz) {
+    char qpath[MAX_PATH];
+    get_questions_path(qpath, sizeof(qpath));
+
+    FILE *f = fopen(qpath, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    if (fsize <= 0) { fclose(f); return 0; }
+    fseek(f, 0, SEEK_SET);
+    char *content = (char *)malloc(fsize + 1);
+    if (!content) { fclose(f); return 0; }
+    size_t clen = fread(content, 1, fsize, f);
+    content[clen] = 0;
+    fclose(f);
+
+    /* 统计行数 */
+    int total_lines = 0;
+    const char *p = content;
+    while (*p) {
+        if (*p == '\n') total_lines++;
+        p++;
+    }
+    /* 最后一行可能无换行符 */
+    if (clen > 0 && content[clen-1] != '\n') total_lines++;
+    if (total_lines == 0) { free(content); return 0; }
+
+    /* 随机选一行 */
+    uint8_t rnd[4];
+    CryptGenRandom(g_crypt, 4, rnd);
+    uint32_t ridx = ((uint32_t)rnd[0] << 16) | ((uint32_t)rnd[1] << 8) | rnd[2];
+    int target = (int)(ridx % total_lines);
+
+    /* 找到目标行 */
+    int line_idx = 0;
+    const char *line_start = content;
+    const char *line_end = NULL;
+    p = content;
+    while (*p) {
+        if (*p == '\n') {
+            if (line_idx == target) {
+                line_end = p;
+                break;
+            }
+            line_idx++;
+            line_start = p + 1;
+        }
+        p++;
+    }
+    if (!line_end) {
+        /* 最后一行无换行符 */
+        if (line_idx == target) {
+            line_end = content + clen;
+        } else {
+            free(content);
+            return 0;
+        }
+    }
+
+    /* 提取问题文本(去行尾\r和空白) */
+    size_t qlen = (size_t)(line_end - line_start);
+    while (qlen > 0 && (line_start[qlen-1] == '\r' || line_start[qlen-1] == ' ' || line_start[qlen-1] == '\t'))
+        qlen--;
+    if (qlen == 0 || qlen >= outsz) { free(content); return 0; }
+    memcpy(out, line_start, qlen);
+    out[qlen] = 0;
+
+    /* 重写文件: 删除已选行 */
+    f = fopen(qpath, "w");
+    if (f) {
+        /* 写 target 之前的行 */
+        if (target > 0)
+            fwrite(content, 1, (size_t)(line_start - content), f);
+        /* 写 target 之后的行 */
+        if (*line_end == '\n')
+            fwrite(line_end + 1, 1, clen - (size_t)(line_end - content) - 1, f);
+        else
+            fwrite(line_end, 1, clen - (size_t)(line_end - content), f);
+        fclose(f);
+    }
+
+    free(content);
+    return 1;
+}
+/**
+ * chat_param - 对话线程参数
+ *
+ * 安全设计: 只存密码的 SHA256 哈希(SHA256(明文))，不存明文。
+ * eaichat 登录只需该哈希(POST的password字段即SHA256(明文))，
+ * 因此线程内可凭哈希完成登录，明文密码不必长期驻留内存。
+ * 哈希是单向的，泄漏后无法逆推明文，风险远低于明文常驻。
+ */
+typedef struct {
+    char user[128];
+    char password_sha[65];  /* SHA256(明文密码)的64位hex + \0 */
+} ChatParam;
+/**
+ * save_chat_state - 持久化 chat 会话状态到 config.json 的 chat_dpapi 字段
+ *
+ * config.json 格式:
+ *   {"version":2,"dpapi":"<凭据>","chat_dpapi":"<base64(DPAPI(chat_json))>"}
+ * chat_dpapi 与 dpapi 独立加密，互不影响。
+ *
+ * 隐私模式 /p 下不保存。
+ */
+static void save_chat_state(void) {
+    if (!g_chat.client_key[0]) return;  /* 无 client_key 说明从未登录过，不保存 */
+
+    char exe_path[MAX_PATH];
+    GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+    char *slash = strrchr(exe_path, '\\');
+    if (slash) *slash = 0;
+    char config_path[MAX_PATH];
+    snprintf(config_path, sizeof(config_path), "%s\\config.json", exe_path);
+
+    char fp[65];
+    get_fingerprint(fp);
+
+    /* 构造 chat 内部 JSON */
+    size_t need = 256 + strlen(g_chat.cookies) + strlen(g_chat.session_key) +
+                  strlen(g_chat.client_key) + strlen(g_chat.xuid);
+    char *inner = (char *)malloc(need);
+    if (!inner) return;
+    int ilen = snprintf(inner, need,
+        "{\"client_key\":\"%s\",\"cookies\":\"%s\",\"sk\":\"%s\","
+        "\"session_key\":\"%s\",\"xuid\":\"%s\",\"tenant_id\":%d,"
+        "\"last_sent_date\":\"%s\"}",
+        g_chat.client_key, g_chat.cookies, g_chat.sk,
+        g_chat.session_key, g_chat.xuid, g_chat.tenant_id,
+        g_chat.last_sent_date);
+
+    /* DPAPI 加密 */
+    uint8_t *ct = NULL; DWORD ct_len = 0;
+    if (!protect_data_dpapi((const uint8_t *)inner, (DWORD)ilen, fp, &ct, &ct_len)) {
+        SecureZeroMemory(inner, ilen);
+        free(inner);
+        return;
+    }
+    SecureZeroMemory(inner, ilen);
+    free(inner);
+
+    size_t b64_need = ((size_t)ct_len + 2) / 3 * 4 + 1;
+    char *b64 = (char *)malloc(b64_need);
+    if (!b64) { LocalFree(ct); return; }
+    b64enc(ct, ct_len, b64);
+    LocalFree(ct);
+
+    /* 读取现有 config.json，合并 chat_dpapi 字段后写回 */
+    FILE *f = fopen(config_path, "rb");
+    char *old = NULL;
+    size_t old_len = 0;
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        old_len = (size_t)ftell(f);
+        if (old_len > 0 && old_len < 1024 * 1024) {
+            fseek(f, 0, SEEK_SET);
+            old = (char *)malloc(old_len + 1);
+            if (old) {
+                size_t rd = fread(old, 1, old_len, f);
+                old[rd] = 0;
+            }
+        }
+        fclose(f);
+    }
+
+    /* 构造新的 config.json */
+    char *new_cfg = NULL;
+    if (old && old[0]) {
+        /* 查找已有的 "chat_dpapi" 字段 */
+        const char *cdp = strstr(old, "\"chat_dpapi\"");
+        if (cdp) {
+            /* 替换现有值: 找到值的起止引号 */
+            const char *vp = cdp + strlen("\"chat_dpapi\"");
+            while (*vp == ' ' || *vp == ':') vp++;
+            if (*vp == '"') {
+                vp++;
+                const char *ve = strchr(vp, '"');
+                if (ve) {
+                    size_t prefix_len = (size_t)(vp - old);
+                    size_t suffix_start = (size_t)(ve - old);
+                    size_t new_len = prefix_len + strlen(b64) + (old_len - suffix_start) + 1;
+                    new_cfg = (char *)malloc(new_len);
+                    if (new_cfg) {
+                        memcpy(new_cfg, old, prefix_len);
+                        strcpy(new_cfg + prefix_len, b64);
+                        strcat(new_cfg, old + suffix_start);
+                    }
+                }
+            }
+        } else {
+            /* 追加到 JSON 末尾(在最后一个 } 前插入) */
+            char *last_brace = strrchr(old, '}');
+            if (last_brace) {
+                size_t pos = (size_t)(last_brace - old);
+                /* 检查 } 前是否需要逗号 */
+                size_t i = pos;
+                int need_comma = 0;
+                while (i > 0 && (old[i-1] == ' ' || old[i-1] == '\t' ||
+                                 old[i-1] == '\r' || old[i-1] == '\n')) i--;
+                if (i > 0 && old[i-1] != '{') need_comma = 1;
+
+                size_t new_len = pos + (need_comma ? 1 : 0) +
+                                 strlen(",\"chat_dpapi\":\"") + strlen(b64) +
+                                 strlen("\"}") + 1;
+                new_cfg = (char *)malloc(new_len);
+                if (new_cfg) {
+                    memcpy(new_cfg, old, pos);
+                    new_cfg[pos] = 0;
+                    if (need_comma) strcat(new_cfg, ",");
+                    strcat(new_cfg, "\"chat_dpapi\":\"");
+                    strcat(new_cfg, b64);
+                    strcat(new_cfg, "\"}");
+                }
+            }
+        }
+    } else {
+        /* 无现有 config.json，创建新的 */
+        size_t new_len = strlen("{\"chat_dpapi\":\"") + strlen(b64) + strlen("\"}") + 1;
+        new_cfg = (char *)malloc(new_len);
+        if (new_cfg) {
+            strcpy(new_cfg, "{\"chat_dpapi\":\"");
+            strcat(new_cfg, b64);
+            strcat(new_cfg, "\"}");
+        }
+    }
+    if (old) { SecureZeroMemory(old, old_len); free(old); }
+
+    if (new_cfg) {
+        f = fopen(config_path, "w");
+        if (f) {
+            fputs(new_cfg, f);
+            fclose(f);
+        }
+        free(new_cfg);
+    }
+    free(b64);
+}
+/**
+ * load_chat_state - 从 config.json 的 chat_dpapi 字段恢复 chat 会话状态
+ *
+ * @return 1=成功恢复, 0=无 chat_dpapi 或解密失败
+ */
+static int load_chat_state(void) {
+    char exe_path[MAX_PATH];
+    GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+    char *slash = strrchr(exe_path, '\\');
+    if (slash) *slash = 0;
+    char config_path[MAX_PATH];
+    snprintf(config_path, sizeof(config_path), "%s\\config.json", exe_path);
+
+    FILE *f = fopen(config_path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    if (fsize <= 0 || fsize > 65536) { fclose(f); return 0; }
+    fseek(f, 0, SEEK_SET);
+    char *content = (char *)malloc(fsize + 1);
+    if (!content) { fclose(f); return 0; }
+    size_t clen = fread(content, 1, fsize, f);
+    content[clen] = 0;
+    fclose(f);
+
+    char fp[65];
+    get_fingerprint(fp);
+
+    int got = 0;
+    /* 查找 "chat_dpapi" 字段(而非 "dpapi") */
+    const char *dp = strstr(content, "\"chat_dpapi\"");
+    if (dp) {
+        dp += strlen("\"chat_dpapi\"");
+        while (*dp == ' ' || *dp == ':') dp++;
+        if (*dp == '"') {
+            dp++;
+            const char *dpe = strchr(dp, '"');
+            if (dpe) {
+                size_t dp_len = (size_t)(dpe - dp);
+                uint8_t *ct = (uint8_t *)malloc(dp_len);
+                if (ct) {
+                    size_t ct_len = b64dec(dp, dp_len, ct);
+                    if (ct_len > 0) {
+                        uint8_t *inner = NULL; DWORD inner_len = 0;
+                        if (unprotect_data_dpapi(ct, (DWORD)ct_len, fp, &inner, &inner_len)) {
+                            char *json = (char *)malloc(inner_len + 1);
+                            if (json) {
+                                memcpy(json, inner, inner_len);
+                                json[inner_len] = 0;
+                                /* 解析各字段 */
+                                jstr(json, "client_key", g_chat.client_key, sizeof(g_chat.client_key));
+                                jstr(json, "cookies", g_chat.cookies, sizeof(g_chat.cookies));
+                                jstr(json, "sk", g_chat.sk, sizeof(g_chat.sk));
+                                jstr(json, "session_key", g_chat.session_key, sizeof(g_chat.session_key));
+                                jstr(json, "xuid", g_chat.xuid, sizeof(g_chat.xuid));
+                                jstr(json, "last_sent_date", g_chat.last_sent_date, sizeof(g_chat.last_sent_date));
+                                char tid[16]; jstr(json, "tenant_id", tid, sizeof(tid));
+                                if (tid[0]) g_chat.tenant_id = atoi(tid);
+                                else g_chat.tenant_id = 15;
+                                if (g_chat.sk[0]) g_chat.logged_in = 1;
+                                SecureZeroMemory(json, inner_len);
+                                free(json);
+                                got = 1;
+                            }
+                            LocalFree(inner);
+                        }
+                    }
+                    free(ct);
+                }
+            }
+        }
+    }
+    free(content);
+    return got;
+}
+/**
+ * chat_do_daily_task - 执行一次对话任务(登录+发消息)
+ *
+ * @return 1=成功, 0=失败
+ */
+static int chat_do_daily_task(ChatParam *cp) {
+    if (!g_chat.logged_in) {
+        if (!chat_login(&g_chat, cp->user, cp->password_sha)) {
+            log_line("[eaichat] 登录失败，跳过本次对话");
+            return 0;
+        }
+        save_chat_state();  /* 登录成功后持久化会话 */
+    }
+
+    /* 检查问题列表是否存在且有剩余问题 */
+    char question[1024];
+    if (!pick_question(question, sizeof(question))) {
+        /* 无问题或文件不存在，生成新列表 */
+        if (!generate_questions()) {
+            log_line("[eaichat] 生成问题列表失败，跳过本次对话");
+            return 0;
+        }
+        /* 生成后重新取问题 */
+        if (!pick_question(question, sizeof(question))) {
+            log_line("[eaichat] 问题列表仍为空，跳过本次对话");
+            return 0;
+        }
+    }
+
+    log_line("[eaichat] 提问: %s", question);
+
+    char reply[4096];
+    int send_ok = chat_send_message(&g_chat, question, reply, sizeof(reply), "");
+    if (!send_ok) {
+        /* 可能cookie过期，重新登录再试一次 */
+        log_line("[eaichat] 发送失败，尝试重新登录");
+        g_chat.logged_in = 0;
+        if (chat_login(&g_chat, cp->user, cp->password_sha)) {
+            save_chat_state();  /* 重登后也持久化 */
+            if (chat_send_message(&g_chat, question, reply, sizeof(reply), "")) {
+                log_line("[eaichat] 回答: %s", reply);
+                log_line("[eaichat] 重登后对话成功");
+                return 1;
+            }
+        }
+        return 0;
+    }
+    log_line("[eaichat] 回答: %s", reply);
+    return 1;
+}
+
+/* ======================== 计划任务纯C自注册 ======================== */
+
+#define POINTS_TASK_NAME        "ctyun_points"
+#define POINTS_TASK_XML_NAME    L"ctyun_points_task.xml"
+
+/* 隐藏窗口运行 schtasks.exe，返回其退出码；CreateProcess 失败返回 -1 */
+static int run_schtasks_hidden(const wchar_t *args) {
+    wchar_t cmdline[1024];
+    _snwprintf(cmdline, 1023, L"schtasks.exe %s", args);
+    cmdline[1023] = 0;
+    STARTUPINFOW si;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&pi, sizeof(pi));
+    if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi)) {
+        log_line("schtasks 启动失败: %lu", (unsigned long)GetLastError());
+        return -1;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return (int)code;
+}
+
+/* 组装 Task Scheduler XML（UTF-8），返回堆字符串(调用者free) */
+static char *build_points_task_xml(const char *exe_path, const char *exe_dir,
+                                   const char *today) {
+    const char *fmt =
+"<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n"
+"<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n"
+"  <RegistrationInfo>\r\n"
+"    <Description>ctyun points daily keepalive (auto registered by ctyun_points.exe)</Description>\r\n"
+"  </RegistrationInfo>\r\n"
+"  <Triggers>\r\n"
+"    <CalendarTrigger>\r\n"
+"      <StartBoundary>%sT05:00:00</StartBoundary>\r\n"
+"      <Enabled>true</Enabled>\r\n"
+"      <ScheduleByDay>\r\n"
+"        <DaysInterval>1</DaysInterval>\r\n"
+"      </ScheduleByDay>\r\n"
+"    </CalendarTrigger>\r\n"
+"  </Triggers>\r\n"
+"  <Principals>\r\n"
+"    <Principal id=\"Author\">\r\n"
+"      <LogonType>InteractiveToken</LogonType>\r\n"
+"      <RunLevel>LeastPrivilege</RunLevel>\r\n"
+"    </Principal>\r\n"
+"  </Principals>\r\n"
+"  <Settings>\r\n"
+"    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n"
+"    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n"
+"    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n"
+"    <AllowHardTerminate>true</AllowHardTerminate>\r\n"
+"    <StartWhenAvailable>true</StartWhenAvailable>\r\n"
+"    <Enabled>true</Enabled>\r\n"
+"    <ExecutionTimeLimit>PT7H</ExecutionTimeLimit>\r\n"
+"  </Settings>\r\n"
+"  <Actions Context=\"Author\">\r\n"
+"    <Exec>\r\n"
+"      <Command>%s</Command>\r\n"
+"      <WorkingDirectory>%s</WorkingDirectory>\r\n"
+"    </Exec>\r\n"
+"  </Actions>\r\n"
+"</Task>\r\n";
+    size_t cap = strlen(fmt) + strlen(exe_path) + strlen(exe_dir) + 64;
+    char *xml = (char *)malloc(cap);
+    if (!xml) return NULL;
+    snprintf(xml, cap, fmt, today, exe_path, exe_dir);
+    return xml;
+}
+
+static int points_task_register(int verbose) {
+    char exe_path[MAX_PATH], exe_dir[MAX_PATH];
+    DWORD got = GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+    if (got == 0 || got >= MAX_PATH) return 0;
+    strncpy(exe_dir, exe_path, sizeof(exe_dir) - 1);
+    exe_dir[sizeof(exe_dir) - 1] = 0;
+    char *slash = strrchr(exe_dir, '\\');
+    if (slash) *slash = 0; else return 0;
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char today[16];
+    snprintf(today, sizeof(today), "%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
+
+    char *xml_utf8 = build_points_task_xml(exe_path, exe_dir, today);
+    if (!xml_utf8) return 0;
+
+    wchar_t tmp_dir[MAX_PATH], tmp_path[MAX_PATH];
+    DWORD tl = GetTempPathW(MAX_PATH, tmp_dir);
+    int ok = 0;
+    HANDLE hf = INVALID_HANDLE_VALUE;
+    if (tl > 0 && tl < MAX_PATH) {
+        _snwprintf(tmp_path, MAX_PATH, L"%s%s", tmp_dir, POINTS_TASK_XML_NAME);
+        tmp_path[MAX_PATH - 1] = 0;
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, xml_utf8, -1, NULL, 0);
+        if (wlen > 0) {
+            wchar_t *xml_w = (wchar_t *)malloc((size_t)wlen * sizeof(wchar_t));
+            if (xml_w && MultiByteToWideChar(CP_UTF8, 0, xml_utf8, -1, xml_w, wlen) > 0) {
+                /* 写 UTF-16LE 文件(含 BOM)，与 encoding="UTF-16" 匹配 */
+                hf = CreateFileW(tmp_path, GENERIC_WRITE, 0, NULL,
+                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                if (hf != INVALID_HANDLE_VALUE) {
+                    DWORD wr;
+                    unsigned char bom[2] = { 0xFF, 0xFE };
+                    if (WriteFile(hf, bom, 2, &wr, NULL) &&
+                        WriteFile(hf, xml_w, (DWORD)((wlen - 1) * sizeof(wchar_t)),
+                                  &wr, NULL)) {
+                        CloseHandle(hf);
+                        hf = INVALID_HANDLE_VALUE;
+                        wchar_t args[1200];
+                        _snwprintf(args, 1199,
+                                   L"/Create /TN %hs /XML \"%ls\" /F",
+                                   POINTS_TASK_NAME, tmp_path);
+                        args[1199] = 0;
+                        int rc = run_schtasks_hidden(args);
+                        ok = (rc == 0);
+                        if (!ok) log_line("schtasks /Create 失败, 退出码=%d", rc);
+                    }
+                }
+            }
+            free(xml_w);
+        }
+    }
+    if (hf != INVALID_HANDLE_VALUE) CloseHandle(hf);
+    DeleteFileW(tmp_path);
+    free(xml_utf8);
+    if (verbose) {
+        if (ok) printf("计划任务 %s 安装成功：每日 05:00 交互登录时自动运行，时限 PT7H。\n",
+                       POINTS_TASK_NAME);
+        else printf("计划任务安装失败，请查看日志(points.log)。\n");
+    }
+    return ok;
+}
+
+static int points_task_unregister(int verbose) {
+    wchar_t args[128];
+    _snwprintf(args, 127, L"/Delete /TN %hs /F", POINTS_TASK_NAME);
+    args[127] = 0;
+    int rc = run_schtasks_hidden(args);
+    int ok = (rc == 0);
+    if (verbose) {
+        if (ok) printf("计划任务 %s 已卸载。\n", POINTS_TASK_NAME);
+        else printf("计划任务卸载失败(退出码=%d；任务可能本就不存在)。\n", rc);
+    }
+    return ok;
+}
+
+int install_points_task(void) {
+    log_open();
+    return points_task_register(1) ? 0 : 1;
+}
+
+int uninstall_points_task(void) {
+    log_open();
+    return points_task_unregister(1) ? 0 : 1;
+}
+
 int main(int argc, char *argv[]) {
     SetConsoleOutputCP(CP_UTF8);
     srand((unsigned)time(NULL));
@@ -2808,6 +2626,7 @@ int main(int argc, char *argv[]) {
     int tasklist_only = 0;
     int dump_only = 0;
     int fixed_secs = 0;   /* 是否显式指定固定时长(指定则关闭自适应) */
+    int nochat = 0;       /* /nochat: 本次不执行每日AI对话 */   /* 是否显式指定固定时长(指定则关闭自适应) */
 
     for (int i = 1; i < argc; i++) {
         if (_stricmp(argv[i], "/help") == 0 || _stricmp(argv[i], "/h") == 0 ||
@@ -2820,6 +2639,9 @@ int main(int argc, char *argv[]) {
             printf("  (无参数)                   自适应挂机: 保活并周期自查1003，拿满即止，硬上限4小时\n");
             printf("  /seconds <秒> /s <秒>     指定固定挂机时长(显式指定后关闭自适应, <%d秒)\n", 7200);
             printf("  /tasklist     /t           仅登录并查询积分任务列表(测试验证，不兑换)后退出\n");
+            printf("  /install                    安装每日05:00积分挂机计划任务(自注册)\n");
+            printf("  /uninstall                  卸载积分挂机计划任务\n");
+            printf("  /nochat                     本次运行不执行每日AI对话任务\n");
             printf("  /help         /h           显示帮助信息\n");
             printf("  /version      /v           显示版本号\n\n");
             printf("凭据获取优先级:\n");
@@ -2845,6 +2667,12 @@ int main(int argc, char *argv[]) {
             tasklist_only = 1;
         } else if (_stricmp(argv[i], "/dump") == 0 || _stricmp(argv[i], "--dump") == 0) {
             dump_only = 1;
+        } else if (_stricmp(argv[i], "/install") == 0) {
+            return install_points_task();
+        } else if (_stricmp(argv[i], "/uninstall") == 0) {
+            return uninstall_points_task();
+        } else if (_stricmp(argv[i], "/nochat") == 0) {
+            nochat = 1;
         } else if ((_stricmp(argv[i], "/seconds") == 0 || _stricmp(argv[i], "/s") == 0 ||
                     _stricmp(argv[i], "-s") == 0 || _stricmp(argv[i], "--seconds") == 0) && i + 1 < argc) {
             int v = atoi(argv[i + 1]);
@@ -2888,6 +2716,15 @@ int main(int argc, char *argv[]) {
     if (!tasklist_only && !dump_only)
         InterlockedExchange(&g_adaptive, fixed_secs ? 0 : 1);
 
+    /* 仅"无参进入当日挂机流程"时尽力幂等自注册；失败只警告，不影响本次运行 */
+    {
+        int normal_hang = (!tasklist_only && !dump_only && !fixed_secs);
+        if (normal_hang) {
+            if (points_task_register(0)) log_line("计划任务已就绪(每日05:00自启动)");
+            else log_line("计划任务自注册失败(不影响本次运行)，可稍后用 /install 手动安装");
+        }
+    }
+
     if (g_adaptive) {
         log_line("自适应挂机模式: 维持活跃clink会话，每%ld秒自查任务1003，拿满%d即止；硬上限%ld秒(%.2f小时)",
                  (long)g_task_check_secs, TASK_1003_TARGET, (long)g_adaptive_max,
@@ -2917,6 +2754,7 @@ int main(int argc, char *argv[]) {
         log_line("加密模块初始化失败");
         return 1;
     }
+    if (!chat_aes_init()) log_line("AES提供者初始化失败，eaichat对话功能将不可用");
 
     if (!http_init()) {
         log_line("HTTP模块初始化失败");
@@ -2997,6 +2835,30 @@ int main(int argc, char *argv[]) {
         query_task_list(&s);
         result = 1;
     } else {
+        /* ---- 每日 eaichat AI 对话(任何失败只记日志，不影响挂机) ---- */
+        if (!nochat) {
+            ChatParam chat_cp = {0};
+            load_chat_state();
+            SYSTEMTIME cst;
+            GetLocalTime(&cst);
+            char chat_today[16];
+            snprintf(chat_today, sizeof(chat_today), "%04d-%02d-%02d",
+                     cst.wYear, cst.wMonth, cst.wDay);
+            if (strcmp(g_chat.last_sent_date, chat_today) != 0) {
+                strncpy(chat_cp.user, user, sizeof(chat_cp.user) - 1);
+                sha256_hex(pass, chat_cp.password_sha);
+                if (!chat_cp.user[0] || !chat_cp.password_sha[0])
+                    load_chat_credentials_from_config(chat_cp.user, chat_cp.password_sha,
+                                                      sizeof(chat_cp.user));
+                if (chat_cp.user[0] && chat_do_daily_task(&chat_cp)) {
+                    strncpy(g_chat.last_sent_date, chat_today,
+                            sizeof(g_chat.last_sent_date) - 1);
+                    g_chat.last_sent_date[sizeof(g_chat.last_sent_date) - 1] = 0;
+                    save_chat_state();
+                }
+                SecureZeroMemory(chat_cp.password_sha, sizeof(chat_cp.password_sha));
+            }
+        }
         result = hang_for_points(&s, user, pass);
     }
 
