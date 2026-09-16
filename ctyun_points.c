@@ -3,7 +3,7 @@
  *
  * 公共逻辑见 ctyun_common.c / ctyun_common.h；eaichat 每日对话段自
  * ctyun_keepalive 迁入。v1.5.0 起不再自注册计划任务：由常驻的
- * ctyun_keepalive 每日05:00以子进程方式调用本程序(直接运行keepalive即部署)。
+ * ctyun_keepalive 每日04:00以子进程方式调用本程序(直接运行keepalive即部署)。
  * 本程序带单实例互斥量，重复启动会静默退出，避免同账号重复登录顶号。
  *
  * 编译 (MSVC x64):
@@ -21,7 +21,7 @@
 #define WS_POLL_TIMEOUT_MS  300    /* 单通道轮询接收超时(毫秒) */
 #define CLINK_HB_MAIN_MS    5000   /* MAIN通道应用层心跳间隔 */
 #define CLINK_HB_CHAN_MS    30000  /* DISPLAY/INPUTS通道应用层心跳间隔 */
-#define ADAPTIVE_MAX_SECONDS    21600  /* 硬上限6小时: keepalive 05:00拉起 -> 11:00 */
+#define ADAPTIVE_MAX_SECONDS    21600  /* 硬上限6小时: keepalive 04:00拉起 -> 10:00 */
 #define TASK_CHECK_INTERVAL_SEC 270
 #define TASK_1003_TARGET        3600
 #define SESSION_ROTATE_SECONDS  300
@@ -36,7 +36,7 @@ static volatile LONG g_keep_seconds = KEEPALIVE_SECONDS;
  *   DISPLAY/INPUTS 子通道45秒被服务端踢除并重连无效，因桌面会话租约(connect token)未更新。
  * 对策: 每 g_session_rotate_secs(默认300秒) 主动整体重连(重新 connect，无需重新登录)，
  *   使每段都处于会计量的新鲜会话；同时每 g_task_check_secs 自查1003，拿满即止。 */
-#define ADAPTIVE_MAX_SECONDS    21600  /* 硬上限6小时: keepalive 05:00拉起 -> 11:00 兜底 */
+#define ADAPTIVE_MAX_SECONDS    21600  /* 硬上限6小时: keepalive 04:00拉起 -> 10:00 兜底 */
 #define TASK_CHECK_INTERVAL_SEC 270    /* 约4.5分钟自查一次任务1003 */
 #define TASK_1003_TARGET        3600   /* 任务1003 "使用1小时" 目标秒数 */
 #define SESSION_ROTATE_SECONDS  300    /* 单条clink桌面会话最长连续秒数，到点主动整体重连 */
@@ -2453,7 +2453,7 @@ static int chat_do_daily_task(ChatParam *cp) {
 
 /* ======================== 单实例保护 ======================== */
 /*
- * v1.5.0: 积分流程改由常驻 ctyun_keepalive 每日05:00拉起，不再自注册计划任务。
+ * v1.5.0: 积分流程改由常驻 ctyun_keepalive 每日04:00拉起，不再自注册计划任务。
  * 同名互斥量保证全会话(同一登录桌面)只有一个 points 实例进入登录/挂机流程，
  * 避免手动重复运行或 keepalive 重启补跑时同账号互顶(被顶会触发无谓的重登风暴)。
  * /tasklist、/dump 等一次性查询不受互斥限制。
@@ -2487,7 +2487,7 @@ int main(int argc, char *argv[]) {
             printf("  /user <账号>  /u <账号>    指定登录账号(手机号)\n");
             printf("  /pass <密码>  /p <密码>    指定登录密码\n");
             printf("  (无参数)                   登录→每日AI对话(1004)→自适应挂机(1003)，拿满即止，硬上限6小时。\n"
-                   "                             通常由常驻的 ctyun_keepalive 每日05:00自动调用，也可手动运行\n");
+                   "                             通常由常驻的 ctyun_keepalive 每日04:00自动调用，也可手动运行\n");
             printf("  /seconds <秒> /s <秒>     指定固定挂机时长(显式指定后关闭自适应, <%d秒)\n", 7200);
             printf("  /tasklist     /t           仅登录并查询积分任务列表(测试验证，不兑换)后退出\n");
             printf("  /nochat                     本次运行不执行每日AI对话任务\n");

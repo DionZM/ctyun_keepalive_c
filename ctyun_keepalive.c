@@ -2,7 +2,7 @@
  * ctyun_keepalive.c - 天翼云电脑保活客户端 (C语言版) v1.5.0
  *
  * 公共逻辑(HTTP/加密/登录/WebSocket/桌面解析等)见 ctyun_common.c / ctyun_common.h。
- * v1.5.0 起常驻守护内置"积分调度线程"：每日05:00以无窗口子进程方式拉起
+ * v1.5.0 起常驻守护内置"积分调度线程"：每日04:00以无窗口子进程方式拉起
  * ctyun_points.exe(登录1002 + eaichat 1004 + 挂机1003)，守护晚启动时当天自动补跑；
  * 不再依赖 Windows 计划任务，直接运行本程序即完成全部部署。
  *
@@ -1676,12 +1676,12 @@ void ct_log(const char *fmt, ...) {
 
 /* ======================== 积分程序每日调度 (v1.5.0) ========================
  *
- * 取代 v1.4.0 的计划任务方案：常驻守护自身负责每日 05:00 拉起 ctyun_points.exe。
+ * 取代 v1.4.0 的计划任务方案：常驻守护自身负责每日 04:00 拉起 ctyun_points.exe。
  *
  * 行为:
- *  - 每天 05:00(本地时间)以 CREATE_NO_WINDOW 子进程启动一次 points，工作目录=
+ *  - 每天 04:00(本地时间)以 CREATE_NO_WINDOW 子进程启动一次 points，工作目录=
  *    本 exe 所在目录(points 依赖 cwd 读取 config.json)；
- *  - 守护在 05:00 之后才启动(开机晚/重启)且今天没拉起过 → 立即补跑(StartWhenAvailable)；
+ *  - 守护在 04:00 之后才启动(开机晚/重启)且今天没拉起过 → 立即补跑(StartWhenAvailable)；
  *  - points_launch.dat 记录最后拉起日期；points 另带单实例命名互斥，双重防同账号顶号；
  *  - 调度线程同步等待 points 结束(拿满即止/6h硬上限)，期间不再发起第二次；
  *  - 首次运行幂等删除 v1.4.0 时代的旧计划任务 ctyun_points(退出码非0即"本不存在"，忽略)。
@@ -1692,7 +1692,7 @@ void ct_log(const char *fmt, ...) {
  *  CTYUN_POINTS_KEEP_TASK 非空则不清理旧计划任务
  *  CLI: /testsched        只跑一轮调度逻辑(不登录/不保活)，用于验证
  */
-#define POINTS_SCHED_HOUR     5
+#define POINTS_SCHED_HOUR     4       /* 每日定点拉起积分程序的小时(本地时间) */
 #define POINTS_LEGACY_TASK    "ctyun_points"
 #define POINTS_MARK_FILE      "points_launch.dat"
 #define POINTS_DEFAULT_EXE    "ctyun_points.exe"
@@ -1854,13 +1854,13 @@ static DWORD WINAPI points_scheduler_thread(LPVOID param) {
         long wait_sec;
         const char *decision;
         if (launched) {
-            wait_sec = (long)(fire_t + 86400 - now_t);   /* 今天已跑: 明天05:00 */
+            wait_sec = (long)(fire_t + 86400 - now_t);   /* 今天已跑: 明天04:00 */
             decision = "今日已拉起过，等待次日";
         } else if (fire_t > now_t) {
-            wait_sec = (long)(fire_t - now_t);           /* 今天05:00还没到 */
+            wait_sec = (long)(fire_t - now_t);           /* 今天04:00还没到 */
             decision = "等待今日定点";
         } else {
-            wait_sec = 0;                                /* 05:00已过且未跑: 立即补跑 */
+            wait_sec = 0;                                /* 04:00已过且未跑: 立即补跑 */
             decision = "定点已过且今日未拉起，立即补跑";
         }
         if (wait_sec < 0) wait_sec = 0;
@@ -1919,7 +1919,7 @@ static void usage(const char *exe) {
     printf("  /random,     /r  随机生成设备码(默认基于机器指纹确定性生成)\n");
     printf("  /version,    /v  显示版本号\n");
     printf("  /help,       /h  显示此帮助信息\n\n");
-    printf("常驻运行期间每日05:00自动无窗口调用 ctyun_points.exe 完成积分任务\n");
+    printf("常驻运行期间每日04:00自动无窗口调用 ctyun_points.exe 完成积分任务\n");
     printf("(登录1002 + AI对话1004 + 挂机1003)，无需安装计划任务。\n");
 }
 
