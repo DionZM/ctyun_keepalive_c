@@ -876,7 +876,7 @@ int http_req_with_cookies(const char *method, const char *url,
  * 原因: cas/login 的 URL 含 "?service=https://..."，query 里的 "//" 会触发
  *       WinHTTP 的 URL 规范化，把整条请求路径破坏成 "/cloudB/dy/iam/"，
  *       导致服务端返回登录页而非 302+ticket。curl.exe 不做这种规范化。
- * 长期方案: 改用 libcurl 静态链接(见 TODO.md)。
+ * 长期方案: 改用 libcurl 静态链接。
  *
  * 实现: CreateProcess 启动系统 curl.exe(Win10 1803+/Win11自带)，
  *       curl -s -i -k 输出响应头到 stdout，从输出里解析 Location 行。
