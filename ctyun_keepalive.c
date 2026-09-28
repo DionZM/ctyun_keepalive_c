@@ -24,7 +24,7 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "psapi.lib")
 
-#define APP_VERSION   "1.5.0"
+#define APP_VERSION   "1.5.1"
 
 #define MAX_DESKTOPS  10
 #define MAX_THREADS   (MAX_DESKTOPS + 3)
@@ -1906,6 +1906,47 @@ static DWORD WINAPI points_scheduler_thread(LPVOID param) {
     }
 }
 
+/* ======================== 守护单实例保护 (v1.5.0+) ========================
+ * 自启动计划任务带"每5分钟重复触发"自愈：守护被云平台代理(cloudbase-init/
+ * RestartManager 等)杀掉后，下一次触发即重新拉起。存活期间的重复触发由这里的
+ * 命名互斥挡掉(直接 exit 0)，避免两个守护同时连接桌面导致互相顶号。
+ * 返回: 0=本实例获得唯一运行权；1=已有实例运行(调用方应直接退出)。 */
+#define KEEPALIVE_SINGLE_INSTANCE_MUTEX  "Local\\ctyun_keepalive_single_v1"
+
+static int keepalive_already_running(void) {
+    HANDLE h = CreateMutexA(NULL, TRUE, KEEPALIVE_SINGLE_INSTANCE_MUTEX);
+    if (h && GetLastError() != ERROR_ALREADY_EXISTS) return 0;
+    if (h) CloseHandle(h);
+
+    /* 记录一行到 run.log。用 CreateFileA 内核API并显式允许全共享:
+     * 常驻实例用 CRT fopen 长时间持有该文件，实测重复实例里 fopen_s("a")
+     * (默认 _SH_SECURE) 会因共享模式不兼容静默失败，导致拒绝记录丢失。 */
+    char exe_path[MAX_PATH], log_path[MAX_PATH];
+    DWORD got = GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+    if (got > 0 && got < MAX_PATH) {
+        strncpy(log_path, exe_path, sizeof(log_path) - 1);
+        log_path[sizeof(log_path) - 1] = 0;
+        char *sl = strrchr(log_path, '\\');
+        if (sl) {
+            strcpy(sl + 1, "run.log");
+            HANDLE hf = CreateFileA(log_path, FILE_APPEND_DATA,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hf != INVALID_HANDLE_VALUE) {
+                SYSTEMTIME st; GetLocalTime(&st);
+                char buf[256];
+                int n = snprintf(buf, sizeof(buf),
+                                 "[%02d:%02d:%02d.%03d] 已有一个保活守护实例在运行，本次触发静默退出\r\n",
+                                 st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+                DWORD written = 0;
+                if (n > 0) WriteFile(hf, buf, (DWORD)n, &written, NULL);
+                CloseHandle(hf);
+            }
+        }
+    }
+    return 1;
+}
+
 /**
  * usage - 显示用法帮助
  */
@@ -1963,6 +2004,12 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* /__bg 由计划任务直接拉起时(无/b过渡)进程自带控制台，尽早隐藏避免闪窗 */
+    if (g_background) {
+        HWND hConsole = GetConsoleWindow();
+        if (hConsole) ShowWindow(hConsole, SW_HIDE);
+    }
+
     /* /testsched: 积分调度自测——只跑调度线程一轮，不登录/不连接桌面/不清理计划任务。
      * 配合 CTYUN_POINTS_EXE / CTYUN_POINTS_ARGS 可用替身程序验证拉起与标记文件行为。 */
     if (g_test_sched) {
@@ -1981,6 +2028,14 @@ int main(int argc, char *argv[]) {
         log_line("=== /testsched 结束 ===");
         if (g_log_file) fclose(g_log_file);
         return 0;
+    }
+
+    /* 单实例保护: 自启动任务每5分钟重复触发/手动重复运行时，第二个实例静默退出。
+     * /v /h /testsched 在前面已 return，不受互斥影响。
+     * /b 的前台过渡实例(5秒后派生 /__bg 常驻实例并 ExitProcess)不持锁，否则它
+     * 派生的常驻实例会被互斥挡住；锁由 /__bg 或纯前台实例持有。 */
+    if (!(g_bg_switch && !g_background)) {
+        if (keepalive_already_running()) return 0;
     }
 
     /* 设置控制台字体为Consolas，确保中文正常显示 */
@@ -2118,9 +2173,11 @@ int main(int argc, char *argv[]) {
         trim_working_set(1);
 
         /* v1.5.0: 启动积分每日调度线程(取代计划任务)。必须在 run.log 打开之后启动，
-         * 否则 /__bg 模式下线程首条日志在 g_log_file 就绪前发出而丢失。前台过渡实例与
-         * /__bg 常驻实例都会启动它，靠 points_launch.dat 标记 + points 单实例互斥去重。 */
-        {
+         * 否则 /__bg 模式下线程首条日志在 g_log_file 就绪前发出而丢失。
+         * 仅常驻实例(/__bg)或纯前台实例启动；/b 的5秒过渡实例不启动——否则它会在
+         * 常驻实例之前抢先拉起 points 并立刻 ExitProcess，留下无人跟踪的孤儿 points，
+         * 而常驻实例随后的补跑反而被 points 互斥拒绝、却仍写入当日标记。 */
+        if (!(g_bg_switch && !g_background)) {
             HANDLE h_sched = CreateThread(NULL, THREAD_STACK, points_scheduler_thread, NULL, 0, NULL);
             if (h_sched) CloseHandle(h_sched);
             else log_line("积分调度线程创建失败: %lu", (unsigned long)GetLastError());

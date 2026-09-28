@@ -15,7 +15,7 @@
 
 #include "ctyun_common.h"
 
-#define APP_VERSION   "1.5.0"
+#define APP_VERSION   "1.5.1"
 
 #define KEEPALIVE_SECONDS  5400
 #define WS_POLL_TIMEOUT_MS  300    /* 单通道轮询接收超时(毫秒) */
